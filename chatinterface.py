@@ -152,7 +152,7 @@ def generate_response_with_llm(user_prompt: str, history: list, memory: str, sys
         messages.extend(history)
 
         # Add the latest user input
-        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "user", "content": user_prompt})
 
         logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(user_prompt)}")
 
