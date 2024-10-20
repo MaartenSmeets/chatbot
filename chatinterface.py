@@ -7,6 +7,7 @@ import shelve
 import gradio as gr
 import uuid
 from datetime import datetime
+import hashlib
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
@@ -94,18 +95,21 @@ def close_cache(cache):
     if cache is not None:
         cache.close()
 
-def generate_cache_key(user_prompt: str, memory: str, system_prompt: str, model: str) -> str:
+def generate_cache_key(user_prompt: str, history: list, memory: str, system_prompt: str, model: str) -> str:
     """
-    Generate a unique cache key based on the user prompt, memory, system prompt, and model.
-    Including 'memory' ensures that the cache is specific to the conversation context.
+    Generate a unique cache key based on the user prompt, history, memory, system prompt, and model.
     """
-    return f"{model}:{system_prompt}:{memory}:{user_prompt}"
+    history_str = json.dumps(history)
+    history_hash = hashlib.sha256(history_str.encode('utf-8')).hexdigest()
+    key_components = f"{model}:{system_prompt}:{memory}:{history_hash}:{user_prompt}"
+    cache_key = hashlib.sha256(key_components.encode('utf-8')).hexdigest()
+    return cache_key
 
 # Updated LLM API interaction with proper response handling and correct payload format
-def generate_response_with_llm(user_prompt: str, memory: str, system_prompt: str, model: str) -> str:
+def generate_response_with_llm(user_prompt: str, history: list, memory: str, system_prompt: str, model: str) -> str:
     """Call the LLM via API to generate responses with caching and proper payload format."""
     cache = init_cache()
-    cache_key = generate_cache_key(user_prompt, memory, system_prompt, model)
+    cache_key = generate_cache_key(user_prompt, history, memory, system_prompt, model)
 
     # Check if the result is already cached
     if cache_key in cache:
@@ -117,12 +121,24 @@ def generate_response_with_llm(user_prompt: str, memory: str, system_prompt: str
     # If not cached, call the LLM API
     try:
         # Construct the full message history for the LLM
-        messages = [
-            {"role": "system", "content": system_prompt},  # System prompt
-            {"role": "user", "content": user_prompt}       # User prompt
-        ]
+        messages = []
+
+        # Add system prompt
+        messages.append({"role": "system", "content": system_prompt})
+
+        # Include current time as system message
+        current_time_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+        messages.append({"role": "system", "content": f"The current time is {current_time_str}."})
+
+        # Add memory (summary) if any
         if memory:
-            messages.insert(1, {"role": "assistant", "content": memory})  # Insert memory if available
+            messages.append({"role": "assistant", "content": memory})
+
+        # Add conversation history
+        messages.extend(history)
+
+        # Add the latest user input
+        messages.append({"role": "user", "content": user_prompt})
 
         logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(user_prompt)}")
 
@@ -194,7 +210,7 @@ def summarize_history(history, existing_summary, system_prompt, model):
     # Prepare the summarization prompt
     summarization_prompt = SUMMARY_PROMPT_TEMPLATE.format(conversation=conversation_text)
     # Call the LLM to generate the summary
-    summary = generate_response_with_llm(summarization_prompt, "", system_prompt, model)
+    summary = generate_response_with_llm(summarization_prompt, [], "", system_prompt, model)
     return summary.strip()
 
 # Functions for Gradio UI
@@ -418,7 +434,7 @@ def respond(user_input, history, memory, system_prompt, session_id, character_fi
         _, _, memory = retrieve_session_data(session_id)
     
     # Generate the response from the LLM
-    response = generate_response_with_llm(user_input, memory, system_prompt, MODEL_NAME)
+    response = generate_response_with_llm(user_input, history, memory, system_prompt, MODEL_NAME)
     
     if not response:
         response = "I'm sorry, I couldn't process your request. Please try again."
@@ -478,7 +494,7 @@ def reset_chat(session_id, character_file):
         history,              # history
         memory,               # memory
         system_prompt,        # system_prompt
-        gr.update(value=''), # user_input
+        gr.update(value=''),  # user_input
         character_info        # character_info_display
     )
 
@@ -598,7 +614,7 @@ def main():
                 gr.update(value=loaded_history),                                  # chatbot
                 loaded_history,                                                  # history state
                 loaded_memory,                                                   # memory state
-                system_prompt_value,                                            # system_prompt state
+                system_prompt_value,                                             # system_prompt state
                 character_info                                                   # character_info_display
             )
 
