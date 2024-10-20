@@ -10,8 +10,16 @@ from datetime import datetime
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"        # The model version
-CHARACTER_DIR = 'characters'                    # Directory where character text files are stored
+MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"      # The model version
+CHARACTER_DIR = 'characters'                     # Directory where character text files are stored
+
+# Summarization settings (customizable)
+MAX_CONTEXT_LENGTH = 1000  # Max context length before summarizing
+SUMMARY_PROMPT_TEMPLATE = (
+    "Please provide a concise but comprehensive summary of the following conversation, "
+    "including all important details and topics discussed:\n{conversation}\nSummary:"
+)
+NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 8  # Number of recent messages to keep in history after summarizing
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG)
@@ -31,50 +39,49 @@ def ensure_character_directory():
 # SQLite DB functions for long-term memory storage
 def init_db():
     """Initialize SQLite database for storing conversation summaries and histories."""
-    conn = sqlite3.connect('memory.db')
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS sessions
-                      (session_id TEXT PRIMARY KEY,
-                       character_file TEXT,
-                       history TEXT,
-                       summary TEXT)''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                character_file TEXT,
+                history TEXT,
+                summary TEXT
+            )
+        ''')
+        conn.commit()
 
 def store_session_data(session_id, character_file, history, summary):
     """Store session data including character file, history, and summary in SQLite database."""
-    conn = sqlite3.connect('memory.db')
-    cursor = conn.cursor()
-    # Convert history to JSON string
     history_json = json.dumps(history)
-    cursor.execute('REPLACE INTO sessions (session_id, character_file, history, summary) VALUES (?, ?, ?, ?)',
-                   (session_id, character_file, history_json, summary))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            REPLACE INTO sessions (session_id, character_file, history, summary)
+            VALUES (?, ?, ?, ?)
+        ''', (session_id, character_file, history_json, summary))
+        conn.commit()
 
 def retrieve_session_data(session_id):
     """Retrieve session data including character file, history, and summary from SQLite database."""
-    conn = sqlite3.connect('memory.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT character_file, history, summary FROM sessions WHERE session_id = ?', (session_id,))
-    row = cursor.fetchone()
-    conn.close()
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT character_file, history, summary FROM sessions WHERE session_id = ?
+        ''', (session_id,))
+        row = cursor.fetchone()
     if row:
-        character_file = row[0]
-        history_json = row[1]
-        summary = row[2]
+        character_file, history_json, summary = row
         history = json.loads(history_json) if history_json else []
         return character_file, history, summary
-    else:
-        return None, [], ""
+    return None, [], ""
 
 def delete_session_data(session_id):
     """Delete session data from SQLite database."""
-    conn = sqlite3.connect('memory.db')
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
+        conn.commit()
 
 # Cache initialization using shelve
 def init_cache():
@@ -176,6 +183,20 @@ def generate_response_with_llm(user_prompt: str, memory: str, system_prompt: str
         close_cache(cache)
         return ""
 
+# Function to summarize the conversation history
+def summarize_history(history, existing_summary, system_prompt, model):
+    """Summarize the conversation history using the LLM."""
+    # Prepare the conversation text
+    conversation_text = ""
+    if existing_summary:
+        conversation_text += f"Previous Summary:\n{existing_summary}\n\n"
+    conversation_text += "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in history])
+    # Prepare the summarization prompt
+    summarization_prompt = SUMMARY_PROMPT_TEMPLATE.format(conversation=conversation_text)
+    # Call the LLM to generate the summary
+    summary = generate_response_with_llm(summarization_prompt, "", system_prompt, model)
+    return summary.strip()
+
 # Functions for Gradio UI
 def get_character_files():
     """Retrieve a list of character files from the character directory."""
@@ -189,19 +210,17 @@ def load_character_prompt(character_file):
 
 def get_existing_sessions(character_file):
     """Retrieve a list of existing session IDs for the selected character."""
-    conn = sqlite3.connect('memory.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT session_id FROM sessions WHERE character_file = ?', (character_file,))
-    rows = cursor.fetchall()
-    conn.close()
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT session_id FROM sessions WHERE character_file = ?', (character_file,))
+        rows = cursor.fetchall()
     session_ids = [row[0] for row in rows]
     logger.debug(f"Existing sessions for character '{character_file}': {session_ids}")
     return session_ids
 
 def get_character_name(character_file):
     """Extract character name from character file name."""
-    character_name = os.path.splitext(character_file)[0]
-    return character_name
+    return os.path.splitext(character_file)[0]
 
 def add_name_to_history(history, character_name):
     """Add 'name' field to assistant messages in the history and update content to include character name."""
@@ -336,21 +355,36 @@ def delete_session(character_file, session_id):
     # Update session dropdown choices
     existing_sessions = get_existing_sessions(character_file)
     logger.debug(f"Updated session list after deletion: {existing_sessions}")
-    # Reset chat history and memory
-    history = []
-    memory = ""
+    
+    if not existing_sessions:
+        # If no sessions left, create a new one
+        selected_session_id = str(uuid.uuid4())
+        history = []
+        memory = ""
+        store_session_data(selected_session_id, character_file, history, memory)
+        existing_sessions = [selected_session_id]
+        logger.debug(f"Created new session: {selected_session_id}")
+    else:
+        # If sessions exist, select the first one
+        selected_session_id = existing_sessions[0]
+        stored_character_file, history, memory = retrieve_session_data(selected_session_id)
+        # Add 'name' to assistant messages and update content
+        character_name = get_character_name(character_file)
+        history = add_name_to_history(history, character_name)
+    
     # Load system prompt
     system_prompt = load_character_prompt(character_file)
     # Update character info display
     character_info = update_character_info(character_file)
-    # Return the updated session dropdown
+    
+    # Return the updated session dropdown and related components
     return (
-        gr.update(choices=existing_sessions, value=None),  # session_id_dropdown
-        gr.update(value=[]),                              # chatbot
-        [],                                               # history
-        "",                                               # memory
-        system_prompt,                                    # system_prompt
-        character_info                                    # character_info_display
+        gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
+        gr.update(value=history),                                         # chatbot
+        history,                                                          # history
+        memory,                                                           # memory
+        system_prompt,                                                    # system_prompt
+        character_info                                                    # character_info_display
     )
 
 def respond(user_input, history, memory, system_prompt, session_id, character_file):
@@ -401,8 +435,18 @@ def respond(user_input, history, memory, system_prompt, session_id, character_fi
         {"role": "assistant", "content": f"[{timestamp}] {response}", "name": character_name}
     ]
     
-    # Update memory (summary) if necessary
-    memory += f"\n{response}"
+    # Calculate the total length of the conversation context
+    context_length = sum(len(msg['content']) for msg in history) + len(memory)
+    if context_length > MAX_CONTEXT_LENGTH:
+        # Summarize the history including existing summary
+        summary = summarize_history(history, memory, system_prompt, MODEL_NAME)
+        memory = summary
+        # Keep only the last NUMBER_OF_RECENT_MESSAGES_TO_KEEP messages in history
+        history = history[-NUMBER_OF_RECENT_MESSAGES_TO_KEEP:]
+        logger.info("Context length exceeded maximum. Summarized the history and updated memory.")
+    else:
+        # Optionally update memory
+        pass  # Memory remains unchanged unless summarization occurs
     
     # Store the updated session data
     store_session_data(session_id, character_file, history, memory)
@@ -559,7 +603,11 @@ def main():
             )
 
         # Call load_default_session after the interface is launched
-        demo.load(load_default_session, inputs=None, outputs=[session_id_dropdown, chatbot, history, memory, system_prompt, character_info_display])
+        demo.load(
+            load_default_session,
+            inputs=None,
+            outputs=[session_id_dropdown, chatbot, history, memory, system_prompt, character_info_display]
+        )
 
     # Launch Gradio with share=True if you want a public link
     demo.launch(share=False)  # Set to True if you want to create a public link
