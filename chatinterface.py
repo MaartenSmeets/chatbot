@@ -10,7 +10,7 @@ from datetime import datetime
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "llama3.1:8b-instruct-fp16"        # The model version
+MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"        # The model version
 CHARACTER_DIR = 'characters'                    # Directory where character text files are stored
 
 # Initialize logging
@@ -228,19 +228,32 @@ def on_character_change(character_file):
     logger.debug(f"Updated session list: {existing_sessions}")
     # Load the system prompt
     system_prompt = load_character_prompt(character_file)
-    # Reset chat history and memory
-    history = []
-    memory = ""
     # Update character info display
     character_info = update_character_info(character_file)
+    if existing_sessions:
+        # If there are existing sessions, select the first one
+        selected_session_id = existing_sessions[0]
+        stored_character_file, history, summary = retrieve_session_data(selected_session_id)
+        # Add 'name' to assistant messages and update content
+        character_name = get_character_name(character_file)
+        history = add_name_to_history(history, character_name)
+        memory = summary
+    else:
+        # If no existing sessions, create a new one
+        selected_session_id = str(uuid.uuid4())
+        history = []
+        memory = ""
+        store_session_data(selected_session_id, character_file, history, memory)
+        existing_sessions = [selected_session_id]
+        logger.debug(f"Created new session: {selected_session_id}")
     # Return updates
     return (
-        gr.update(choices=existing_sessions, value=None),  # session_id_dropdown
-        gr.update(value=[]),                              # chatbot
-        [],                                               # history
-        "",                                               # memory
-        system_prompt,                                    # system_prompt
-        character_info                                    # character_info_display
+        gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
+        gr.update(value=history),                                         # chatbot
+        history,                                                          # history
+        memory,                                                           # memory
+        system_prompt,                                                    # system_prompt
+        character_info                                                    # character_info_display
     )
 
 def on_session_change(character_file, session_id):
