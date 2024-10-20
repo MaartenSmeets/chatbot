@@ -3,20 +3,23 @@ import sqlite3
 import requests
 import json
 import logging
+import logging.handlers
 import shelve
 import gradio as gr
 import uuid
 from datetime import datetime
 import hashlib
-import re  # Import re module for regular expressions
+import re
+import traceback  # Import traceback for exception handling
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
 MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"      # The model version
 CHARACTER_DIR = 'characters'                     # Directory where character text files are stored
+LOG_FILE = 'app.log'                             # Log file path
 
 # Summarization settings (customizable)
-MAX_CONTEXT_LENGTH = 1000  # Max context length before summarizing
+MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
 SUMMARY_PROMPT_TEMPLATE = (
     "Please provide a concise but comprehensive summary of the following conversation, "
     "including all important details and topics discussed:\n{conversation}\nSummary:"
@@ -24,8 +27,25 @@ SUMMARY_PROMPT_TEMPLATE = (
 NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 8  # Number of recent messages to keep in history after summarizing
 
 # Initialize logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)  # Use a named logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create handlers
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setLevel(logging.DEBUG)
+
+# Create formatter and add it to handlers
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+console_handler.setFormatter(formatter)
+file_handler.setFormatter(formatter)
+
+# Add handlers to the logger
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 # Ensure the 'characters' directory exists
 def ensure_character_directory():
@@ -52,6 +72,7 @@ def init_db():
             )
         ''')
         conn.commit()
+    logger.info("Initialized SQLite database and ensured 'sessions' table exists.")
 
 def store_session_data(session_id, character_file, history, summary):
     """Store session data including character file, history, and summary in SQLite database."""
@@ -63,6 +84,7 @@ def store_session_data(session_id, character_file, history, summary):
             VALUES (?, ?, ?, ?)
         ''', (session_id, character_file, history_json, summary))
         conn.commit()
+    logger.debug(f"Stored session data for session_id: {session_id}")
 
 def retrieve_session_data(session_id):
     """Retrieve session data including character file, history, and summary from SQLite database."""
@@ -75,7 +97,9 @@ def retrieve_session_data(session_id):
     if row:
         character_file, history_json, summary = row
         history = json.loads(history_json) if history_json else []
+        logger.debug(f"Retrieved session data for session_id: {session_id}")
         return character_file, history, summary
+    logger.debug(f"No session data found for session_id: {session_id}")
     return None, [], ""
 
 def delete_session_data(session_id):
@@ -84,17 +108,20 @@ def delete_session_data(session_id):
         cursor = conn.cursor()
         cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
         conn.commit()
+    logger.info(f"Deleted session data for session_id: {session_id}")
 
 # Cache initialization using shelve
 def init_cache():
     """Initialize the shelve-based cache for persistent storage."""
     cache = shelve.open('chat_cache', writeback=True)  # Persistent cache stored in 'chat_cache'
+    logger.debug("Initialized cache using shelve.")
     return cache
 
 def close_cache(cache):
     """Close the shelve cache when no longer needed."""
     if cache is not None:
         cache.close()
+        logger.debug("Closed the cache.")
 
 def generate_cache_key(user_prompt: str, history: list, memory: str, system_prompt: str, model: str) -> str:
     """
@@ -210,12 +237,14 @@ def generate_response_with_llm(user_prompt: str, history: list, memory: str, sys
 
     except Exception as e:
         logger.error(f"Failed to generate response with LLM: {e}")
+        logger.debug(traceback.format_exc())
         close_cache(cache)
         return ""
 
 # Function to summarize the conversation history
 def summarize_history(history, existing_summary, system_prompt, model):
     """Summarize the conversation history using the LLM."""
+    logger.info("Summarizing conversation history.")
     # Prepare the conversation text
     conversation_text = ""
     if existing_summary:
@@ -225,17 +254,25 @@ def summarize_history(history, existing_summary, system_prompt, model):
     summarization_prompt = SUMMARY_PROMPT_TEMPLATE.format(conversation=conversation_text)
     # Call the LLM to generate the summary
     summary = generate_response_with_llm(summarization_prompt, [], "", system_prompt, model)
+    logger.debug(f"Generated summary: {summary[:100]}")  # Log first 100 chars of summary
     return summary.strip()
 
 # Functions for Gradio UI
 def get_character_files():
     """Retrieve a list of character files from the character directory."""
-    return [f for f in os.listdir(CHARACTER_DIR) if f.endswith('.txt')]
+    character_files = [f for f in os.listdir(CHARACTER_DIR) if f.endswith('.txt')]
+    logger.debug(f"Found character files: {character_files}")
+    return character_files
 
 def load_character_prompt(character_file):
     """Load the system prompt from the selected character file."""
-    with open(os.path.join(CHARACTER_DIR, character_file), 'r', encoding='utf-8') as f:
-        system_prompt = f.read()
+    try:
+        with open(os.path.join(CHARACTER_DIR, character_file), 'r', encoding='utf-8') as f:
+            system_prompt = f.read()
+        logger.debug(f"Loaded system prompt from '{character_file}'.")
+    except FileNotFoundError:
+        logger.error(f"Character file '{character_file}' not found.")
+        system_prompt = ""
     return system_prompt
 
 def get_existing_sessions(character_file):
@@ -260,6 +297,7 @@ def add_name_to_history(history, character_name):
             # Replace "Assistant: " with character_name + ": " in content
             if "Assistant: " in message['content']:
                 message['content'] = message['content'].replace("Assistant: ", f"{character_name}: ")
+    logger.debug(f"Updated history with character name '{character_name}'.")
     return history
 
 def update_character_info(character_file):
@@ -267,6 +305,7 @@ def update_character_info(character_file):
     character_name = get_character_name(character_file)
     current_time = datetime.now().strftime("%d-%m-%Y %H:%M")
     info_text = f"**Talking to:** {character_name} | **Current Date & Time:** {current_time}"
+    logger.debug(f"Updated character info display: {info_text}")
     return gr.update(value=info_text)
 
 def on_character_change(character_file):
@@ -274,7 +313,7 @@ def on_character_change(character_file):
     logger.debug(f"Character changed to: {character_file}")
     # Update session dropdown choices
     existing_sessions = get_existing_sessions(character_file)
-    logger.debug(f"Updated session list: {existing_sessions}")
+    logger.debug(f"Existing sessions for character '{character_file}': {existing_sessions}")
     # Load the system prompt
     system_prompt = load_character_prompt(character_file)
     # Update character info display
@@ -470,6 +509,7 @@ def respond(user_input, history, memory, system_prompt, session_id, character_fi
     
     # Calculate the total length of the conversation context
     context_length = sum(len(msg['content']) for msg in history) + len(memory)
+    logger.debug(f"Context length after appending messages: {context_length}")
     if context_length > MAX_CONTEXT_LENGTH:
         # Summarize the history including existing summary
         summary = summarize_history(history, memory, system_prompt, MODEL_NAME)
@@ -483,6 +523,7 @@ def respond(user_input, history, memory, system_prompt, session_id, character_fi
     
     # Store the updated session data
     store_session_data(session_id, character_file, history, memory)
+    logger.debug("Updated session data stored.")
     
     # Return updated history to both chatbot and history state
     return (
@@ -504,6 +545,7 @@ def reset_chat(session_id, character_file):
     # Update the session data to reset history and memory
     if session_id:
         store_session_data(session_id, character_file, history, memory)
+        logger.debug(f"Session data reset for session ID: {session_id}")
     # Update character info display
     character_info = update_character_info(character_file)
     return (
@@ -518,6 +560,7 @@ def reset_chat(session_id, character_file):
 def main():
     # Initialize the SQLite DB
     init_db()
+    logger.info("Starting the chatbot application.")
 
     # Ensure character directory exists and has default character
     ensure_character_directory()
@@ -531,6 +574,7 @@ def main():
 
     # Set default character file
     default_character_file = character_files[0]
+    logger.info(f"Default character file set to '{default_character_file}'.")
 
     with gr.Blocks() as demo:
         gr.Markdown("# Chatbot with Character Selection and Session Management")
@@ -642,8 +686,9 @@ def main():
             outputs=[session_id_dropdown, chatbot, history, memory, system_prompt, character_info_display]
         )
 
+    logger.info("Launching Gradio app.")
     # Launch Gradio with share=True if you want a public link
-    demo.launch(share=False, server_name="0.0.0.0", server_port=7860)  # Set to True if you want to create a public link
+    demo.launch(share=False, server_name="0.0.0.0", server_port=7860)
 
 if __name__ == "__main__":
     main()
