@@ -8,6 +8,7 @@ import gradio as gr
 import uuid
 from datetime import datetime
 import hashlib
+import re  # Import re module for regular expressions
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
@@ -105,7 +106,13 @@ def generate_cache_key(user_prompt: str, history: list, memory: str, system_prom
     cache_key = hashlib.sha256(key_components.encode('utf-8')).hexdigest()
     return cache_key
 
-# Updated LLM API interaction with proper response handling and correct payload format
+# Function to remove timestamps from the assistant's response
+def remove_timestamps_from_response(response):
+    """Remove timestamps at the beginning of the response."""
+    # Remove timestamps like '[01:30 PM] ' at the beginning of the response
+    return re.sub(r'^\[\d{1,2}:\d{2} [AP]M\]\s*', '', response)
+
+# Updated LLM API interaction
 def generate_response_with_llm(user_prompt: str, history: list, memory: str, system_prompt: str, model: str) -> str:
     """Call the LLM via API to generate responses with caching and proper payload format."""
     cache = init_cache()
@@ -123,8 +130,15 @@ def generate_response_with_llm(user_prompt: str, history: list, memory: str, sys
         # Construct the full message history for the LLM
         messages = []
 
+        # Modify system prompt to instruct the assistant
+        modified_system_prompt = (
+            system_prompt +
+            "\n\nNote: When you reply, do not include timestamps in your messages. "
+            "You should be aware of the time messages were sent, but do not repeat the timestamps in your replies."
+        )
+
         # Add system prompt
-        messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "system", "content": modified_system_prompt})
 
         # Include current time as system message
         current_time_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
@@ -138,7 +152,7 @@ def generate_response_with_llm(user_prompt: str, history: list, memory: str, sys
         messages.extend(history)
 
         # Add the latest user input
-        messages.append({"role": "user", "content": user_prompt})
+        messages.append({"role": "user", "content": user_input})
 
         logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(user_prompt)}")
 
@@ -438,6 +452,9 @@ def respond(user_input, history, memory, system_prompt, session_id, character_fi
     
     if not response:
         response = "I'm sorry, I couldn't process your request. Please try again."
+    else:
+        # Remove any timestamps at the beginning of the response
+        response = remove_timestamps_from_response(response)
     
     # Get current timestamp
     timestamp = datetime.now().strftime("%I:%M %p")
