@@ -626,7 +626,7 @@ def main():
         )
 
     # Launch Gradio with share=True if you want a public link
-    demo.launch(share=False)  # Set to True if you want to create a public link
+    demo.launch(share=False, server_name="0.0.0.0", server_port=7860)  # Set to True if you want to create a public link
 
 if __name__ == "__main__":
     main()
