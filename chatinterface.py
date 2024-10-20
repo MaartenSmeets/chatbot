@@ -109,8 +109,8 @@ def generate_cache_key(user_prompt: str, history: list, memory: str, system_prom
 # Function to remove timestamps from the assistant's response
 def remove_timestamps_from_response(response):
     """Remove timestamps at the beginning of the response."""
-    # Remove timestamps like '[01:30 PM] ' at the beginning of the response
-    return re.sub(r'^\[\d{1,2}:\d{2} [AP]M\]\s*', '', response)
+    # Remove timestamps like '[20-10-2024 13:45] ' at the beginning of the response
+    return re.sub(r'^\[\d{2}-\d{2}-\d{4} \d{2}:\d{2}\]\s*', '', response)
 
 # Updated LLM API interaction
 def generate_response_with_llm(user_prompt: str, history: list, memory: str, system_prompt: str, model: str) -> str:
@@ -140,8 +140,8 @@ def generate_response_with_llm(user_prompt: str, history: list, memory: str, sys
         # Add system prompt
         messages.append({"role": "system", "content": modified_system_prompt})
 
-        # Include current time as system message
-        current_time_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+        # Include current time as system message in European format
+        current_time_str = datetime.now().strftime("%d-%m-%Y %H:%M")
         messages.append({"role": "system", "content": f"The current time is {current_time_str}."})
 
         # Add memory (summary) if any
@@ -265,8 +265,8 @@ def add_name_to_history(history, character_name):
 def update_character_info(character_file):
     """Generate the content for the character info display."""
     character_name = get_character_name(character_file)
-    current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-    info_text = f"**Talking to:** {character_name} | **Current Time:** {current_time}"
+    current_time = datetime.now().strftime("%d-%m-%Y %H:%M")
+    info_text = f"**Talking to:** {character_name} | **Current Date & Time:** {current_time}"
     return gr.update(value=info_text)
 
 def on_character_change(character_file):
@@ -456,8 +456,8 @@ def respond(user_input, history, memory, system_prompt, session_id, character_fi
         # Remove any timestamps at the beginning of the response
         response = remove_timestamps_from_response(response)
     
-    # Get current timestamp
-    timestamp = datetime.now().strftime("%I:%M %p")
+    # Get current timestamp in European format
+    timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
     
     # Extract character name
     character_name = get_character_name(character_file)
