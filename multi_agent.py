@@ -54,6 +54,15 @@ logger.addHandler(file_handler)
 cache = None
 cache_lock = threading.RLock()  # Use RLock for reentrant locking
 
+# Message queue for auto chat
+message_queue = queue.Queue()
+
+# Global state to control auto mode
+auto_mode_active = False
+selected_characters_global = []
+session_id_global = None
+auto_chat_thread = None
+
 # Ensure the 'characters' directory exists
 def ensure_character_directory():
     """Ensure the 'characters' directory exists, create it if not, and add default characters."""
@@ -157,13 +166,13 @@ def close_cache():
 atexit.register(close_cache)
 
 # Function to generate a unique cache key
-def generate_cache_key(user_prompt: str, history: list, summary: str, system_prompt: str, model: str) -> str:
+def generate_cache_key(user_prompt: str, history: list, summary: str, system_prompt: str, model: str, is_decision: bool = False) -> str:
     """
-    Generate a unique cache key based on the user prompt, history, summary, system prompt, and model.
+    Generate a unique cache key based on the user prompt, history, summary, system prompt, model, and decision flag.
     """
     history_str = json.dumps(history)
     history_hash = hashlib.sha256(history_str.encode('utf-8')).hexdigest()
-    key_components = f"{model}:{system_prompt}:{summary}:{history_hash}:{user_prompt}"
+    key_components = f"{model}:{system_prompt}:{summary}:{history_hash}:{user_prompt}:{is_decision}"
     cache_key = hashlib.sha256(key_components.encode('utf-8')).hexdigest()
     return cache_key
 
@@ -207,9 +216,17 @@ def get_existing_sessions():
     return session_ids
 
 # Function to extract character name from file
-def get_character_name(character_file):
-    """Extract character name from character file name."""
-    return os.path.splitext(character_file)[0]
+def get_character_name(character_file_or_prompt):
+    """Extract character name from character file name or prompt."""
+    if isinstance(character_file_or_prompt, str):
+        if character_file_or_prompt.endswith('.txt'):
+            return os.path.splitext(character_file_or_prompt)[0]
+        else:
+            # If it's a prompt, try to extract the name from "You are [Name]" pattern
+            match = re.search(r"You are (\w+)", character_file_or_prompt)
+            if match:
+                return match.group(1)
+    return "Assistant"  # Default name if extraction fails
 
 # Function to add 'name' and 'timestamp' to history if missing
 def add_name_to_history(history):
@@ -240,10 +257,7 @@ def format_history_for_display(history):
                 'content': f"[{timestamp}] {content}"
             })
         else:
-            if name:
-                formatted_content = f"[{timestamp}] {name}: {content}"
-            else:
-                formatted_content = f"[{timestamp}] {content}"
+            formatted_content = f"[{timestamp}] **{name}**: {content}"
             formatted.append({
                 'role': role,
                 'content': formatted_content
@@ -410,7 +424,7 @@ def respond(user_input, history, summary, session_id):
         gr.update(value=''),                                  # user_input
         session_id                                             # session_id state
     )
-
+    
 # Message queue for auto chat
 message_queue = queue.Queue()
 
@@ -421,14 +435,13 @@ session_id_global = None
 auto_chat_thread = None
 
 # Function to start auto chat
-# Function to start auto chat
 def start_auto_chat(selected_characters, session_id):
     """Start the auto chat thread."""
     global auto_mode_active, selected_characters_global, session_id_global, auto_chat_thread, cache, character_prompts
 
     if not selected_characters:
         logger.warning("No characters selected for auto chat.")
-        return []  # No outputs
+        return []  # Return empty list instead of None
 
     if not session_id:
         logger.info("No session selected for auto chat. Creating a new session.")
@@ -442,7 +455,7 @@ def start_auto_chat(selected_characters, session_id):
 
     if auto_mode_active:
         logger.info("Auto chat is already active.")
-        return []  # No outputs
+        return []  # Return empty list instead of None
 
     auto_mode_active = True
     selected_characters_global = selected_characters
@@ -451,121 +464,91 @@ def start_auto_chat(selected_characters, session_id):
     # Make sure character prompts are loaded
     character_prompts = load_all_character_prompts()
 
-    def auto_chat():
-        global auto_mode_active, selected_characters_global, session_id_global, cache, character_prompts
-        current_index = 0
-        try:
-            # Retrieve history and summary at the start
-            history, summary = retrieve_session_data(session_id_global)
+    # Start the auto chat thread
+    auto_chat_thread = threading.Thread(target=auto_chat, daemon=True)
+    auto_chat_thread.start()
+    logger.info("Auto chat thread started.")
 
-            while auto_mode_active:
-                if not selected_characters_global:
-                    logger.warning("No characters selected for auto chat.")
-                    break
+    return []
 
-                current_character_file = selected_characters_global[current_index]
-                current_character_name = get_character_name(current_character_file)
+def auto_chat():
+    global auto_mode_active, selected_characters_global, session_id_global, cache, character_prompts
+    current_index = 0
+    try:
+        # Retrieve history and summary at the start
+        history, summary = retrieve_session_data(session_id_global)
 
-                # Prepare user_prompt from the last message or default
-                if history and history[-1]['role'] == 'assistant':
-                    user_prompt = history[-1]['content']
-                elif history and history[-1]['role'] == 'user':
-                    user_prompt = history[-1]['content']
+        while auto_mode_active:
+            if not selected_characters_global:
+                logger.warning("No characters selected for auto chat.")
+                break
+
+            current_character_file = selected_characters_global[current_index]
+            current_character_name = get_character_name(current_character_file)
+            current_character_prompt = character_prompts[current_character_name]
+
+            # Prepare user_prompt from the last message or default
+            if history and history[-1]['role'] == 'assistant':
+                user_prompt = history[-1]['content']
+            elif history and history[-1]['role'] == 'user':
+                user_prompt = history[-1]['content']
+            else:
+                user_prompt = "Hello"
+
+            # Make decision to participate
+            decision = generate_response_with_llm(user_prompt, history, summary, current_character_prompt, MODEL_NAME, is_decision=True)
+            logger.debug(f"Decision response from LLM for {current_character_name}: {decision}")
+            decision = decision.lower().strip()
+
+            if 'yes' in decision:
+                # Generate response
+                response = generate_response_with_llm(user_prompt, history, summary, current_character_prompt, MODEL_NAME)
+
+                logger.debug(f"Generated response from LLM for {current_character_name}: {response}")
+                if not response:
+                    response = "I'm sorry, I couldn't process your request."
                 else:
-                    user_prompt = "Hello"
+                    response = remove_timestamps_from_response(response)
 
-                # Build the conversation history part for this character
-                conversation_snippet = '\n'.join(
-                    [f"[{msg.get('timestamp', '')}] {msg.get('name', '')}: {msg.get('content', '')}" for msg in history[-5:] if msg['role'] != 'system']
-                )
+                # Get current timestamp
+                timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
 
-                # Build the decision prompt using those parts, ensuring clarity for each character:
-                decision_prompt = (
-                    f"The conversation so far is:\n{conversation_snippet}\n\n"
-                    f"As {current_character_name}, based on your personality and the conversation context, "
-                    "do you want to contribute to the conversation? Respond only with 'yes' if you want to say something, or only with 'no' if you want to pass. "
-                    "The default is 'yes'."
-                )
+                # Append messages with speaker's name and timestamp
+                assistant_message = {
+                    "role": "assistant",
+                    "content": f"{response}",
+                    "name": current_character_name,
+                    "timestamp": timestamp
+                }
+                history.append(assistant_message)
 
-                logger.debug(f"Decision prompt for {current_character_name}: {decision_prompt}")
+                # Put the new message into the queue
+                message_queue.put(assistant_message)
 
-                # Generate cache key for decision prompt
-                cache_key_decision = generate_cache_key(decision_prompt, history, summary, character_prompts[current_character_name], MODEL_NAME)
+                logger.debug(f"{current_character_name} contributed to the conversation.")
+            else:
+                logger.debug(f"{current_character_name} decided to pass their turn.")
 
-                # Attempt to fetch decision from cache
-                with cache_lock:
-                    if cache and cache_key_decision in cache:
-                        logger.debug(f"Cache hit for decision prompt of {current_character_name}")
-                        decision = cache[cache_key_decision]
-                    else:
-                        logger.debug(f"Calling LLM for decision prompt of {current_character_name}")
-                        decision = generate_response_with_llm(decision_prompt, history, summary, character_prompts[current_character_name], MODEL_NAME)
+            # Check if context exceeds maximum length and summarize if necessary
+            context_length = len(json.dumps(history))
+            if context_length > MAX_CONTEXT_LENGTH:
+                summary = summarize_history(history, summary, current_character_prompt, MODEL_NAME, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP)
+                # Keep only the recent messages
+                history = history[-DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP:]
+                logger.info("Context length exceeded maximum. Summarized the conversation.")
 
-                logger.debug(f"Decision response from LLM for {current_character_name}: {decision}")
-                decision = decision.lower().strip()
+            # Store the updated session data with new summary and history
+            store_session_data(session_id_global, history, summary)
 
-                if 'yes' in decision:
-                    # Generate response
-                    response_prompt = user_prompt
-                    cache_key_response = generate_cache_key(response_prompt, history, summary, character_prompts[current_character_name], MODEL_NAME)
+            # Move to next character
+            current_index = (current_index + 1) % len(selected_characters_global)
 
-                    # Attempt to fetch response from cache
-                    with cache_lock:
-                        if cache and cache_key_response in cache:
-                            logger.debug(f"Cache hit for response prompt of {current_character_name}")
-                            response = cache[cache_key_response]
-                        else:
-                            logger.debug(f"Calling LLM for response prompt of {current_character_name}")
-                            response = generate_response_with_llm(response_prompt, history, summary, character_prompts[current_character_name], MODEL_NAME)
-
-                    logger.debug(f"Generated response from LLM for {current_character_name}: {response}")
-                    if not response:
-                        response = "I'm sorry, I couldn't process your request."
-                    else:
-                        response = remove_timestamps_from_response(response)
-
-                    # Get current timestamp
-                    timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
-
-                    # Append messages with speaker's name and timestamp
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": f"{response}",
-                        "name": current_character_name,
-                        "timestamp": timestamp
-                    }
-                    history.append(assistant_message)
-
-                    # Put the new message into the queue
-                    message_queue.put(assistant_message)
-
-                    logger.debug(f"{current_character_name} contributed to the conversation.")
-                else:
-                    logger.debug(f"{current_character_name} decided to pass their turn.")
-
-                # Check if context exceeds maximum length and summarize if necessary
-                context_length = len(json.dumps(history))
-                if context_length > MAX_CONTEXT_LENGTH:
-                    summary = summarize_history(history, summary, character_prompts, MODEL_NAME, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP)
-                    # Keep only the recent messages
-                    history = history[-DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP:]
-                    logger.info("Context length exceeded maximum. Summarized the conversation.")
-                    # Store the updated session data with new summary and reduced history
-                    store_session_data(session_id_global, history, summary)
-                else:
-                    # Store session data without changes to summary
-                    store_session_data(session_id_global, history, summary)
-
-                # Move to next character
-                current_index = (current_index + 1) % len(selected_characters_global)
-
-                # Wait for a short delay to simulate conversation flow
-                time.sleep(5)  # Adjust the delay as needed
-        except Exception as e:
-            logger.error(f"Exception in auto_chat thread: {e}")
-            logger.debug(traceback.format_exc())
-            auto_mode_active = False  # Ensure the flag is reset on exception
-
+            # Wait for a short delay to simulate conversation flow
+            time.sleep(5)  # Adjust the delay as needed
+    except Exception as e:
+        logger.error(f"Exception in auto_chat thread: {e}")
+        logger.debug(traceback.format_exc())
+        auto_mode_active = False  # Ensure the flag is reset on exception
     # Start the auto chat thread
     auto_chat_thread = threading.Thread(target=auto_chat, daemon=True)
     auto_chat_thread.start()
@@ -641,17 +624,18 @@ def summarize_history(history, summary, system_prompt, model, num_recent=DEFAULT
     return summary.strip()
 
 # Function to generate a response from the LLM
-# Function to generate a response from the LLM
-def generate_response_with_llm(user_prompt: str, history: list, summary: str, character_prompt: str, model: str) -> str:
+def generate_response_with_llm(user_prompt: str, history: list, summary: str, character_prompt: str, model: str, is_decision: bool = False) -> str:
     """
     Generate a response from the LLM based on the prompt, context (history), and memory (summary).
     This function interacts with the Ollama API, uses proper message formatting, and leverages caching.
-    It sends messages as a list of dicts with 'role' and 'content'.
+    It sends a system message and a single user message containing the conversation history.
     """
     logger.debug(f"Entered generate_response_with_llm with prompt size {len(user_prompt)}")
     global cache
 
-    cache_key = generate_cache_key(user_prompt, history, summary, character_prompt, model)
+    character_name = get_character_name(character_prompt)
+
+    cache_key = generate_cache_key(user_prompt, history, summary, character_prompt, model, is_decision)
     logger.debug(f"Generated cache key: {cache_key}")
     # Attempt to fetch from cache
     with cache_lock:
@@ -663,29 +647,52 @@ def generate_response_with_llm(user_prompt: str, history: list, summary: str, ch
 
     # If not cached, call the LLM API
     try:
-        # Format the conversation history, excluding system messages
-        messages = []
-
-        # Add system prompt (individual character prompt)
-        messages.append({"role": "system", "content": character_prompt})
-
-        # Add conversation history
+        # Format the conversation history
+        conversation_history = ""
         for message in history:
             if message['role'] in ['user', 'assistant']:
-                msg = {"role": message['role'], "content": message['content']}
-                if 'name' in message and message['role'] == 'assistant':
-                    msg['name'] = message['name']
-                messages.append(msg)
+                timestamp = message.get('timestamp', '')
+                name = message.get('name', 'Unknown')
+                content = message.get('content', '')
+                conversation_history += f"[{timestamp}] {name}: {content}\n"
 
-        # Add current user input
-        messages.append({"role": "user", "content": user_prompt})
+        # Construct the user message with history and instruction
+        if is_decision:
+            full_user_prompt = f"""
+The conversation so far is:
+
+{conversation_history}
+
+As {character_name}, based on your personality and the conversation context, do you want to contribute to the conversation? Respond only with 'yes' if you want to say something, or only with 'no' if you want to pass. The default is 'yes'.
+"""
+        else:
+            full_user_prompt = f"""
+Conversation history:
+
+{conversation_history}
+
+As {character_name}, respond to the latest message:
+
+{user_prompt}
+
+Guidelines:
+1. Stay in character as {character_name}.
+2. Use Markdown for formatting (e.g., **bold**, *italic*, `code`).
+3. Describe appearances, feelings, or thoughts using square brackets [like this].
+4. Keep responses concise yet engaging.
+"""
+
+        messages = [
+            {"role": "system", "content": character_prompt},
+            {"role": "user", "content": full_user_prompt}
+        ]
 
         payload = {
             "model": model,
-            "messages": messages  # Use 'messages' instead of 'prompt'
+            "messages": messages
         }
 
-        logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(user_prompt)}")
+        logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(full_user_prompt)}")
         logger.debug(f"Full payload:\n{json.dumps(payload, indent=2)}")
 
         headers = {'Content-Type': 'application/json'}
@@ -744,7 +751,7 @@ def generate_response_with_llm(user_prompt: str, history: list, summary: str, ch
         logger.error(f"Failed to generate response with LLM: {e}")
         logger.debug(traceback.format_exc())
         return ""
-
+        
 # Main function to set up Gradio interface
 def main():
     global cache, session_id_global
