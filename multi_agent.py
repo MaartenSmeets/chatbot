@@ -17,9 +17,9 @@ import atexit
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"      # The model version
-CHARACTER_DIR = 'characters'                     # Directory where character text files are stored
-LOG_FILE = 'app.log'                             # Log file path
+MODEL_NAME = "vanilj/midnight-miqu-70b-v1.5:latest"  # The model version
+CHARACTER_DIR = 'characters'  # Directory where character text files are stored
+LOG_FILE = 'app.log'  # Log file path
 
 # Summarization settings (configurable)
 MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
@@ -166,21 +166,27 @@ def close_cache():
 atexit.register(close_cache)
 
 # Function to generate a unique cache key
-def generate_cache_key(user_prompt: str, history: list, summary: str, system_prompt: str, model: str, is_decision: bool = False) -> str:
+def generate_cache_key(user_prompt: str, history: list, summary: str, system_prompt: str, model: str) -> str:
     """
-    Generate a unique cache key based on the user prompt, history, summary, system prompt, model, and decision flag.
+    Generate a unique cache key based on the user prompt, history, summary, system prompt, and model.
     """
     history_str = json.dumps(history)
     history_hash = hashlib.sha256(history_str.encode('utf-8')).hexdigest()
-    key_components = f"{model}:{system_prompt}:{summary}:{history_hash}:{user_prompt}:{is_decision}"
+    key_components = f"{model}:{system_prompt}:{summary}:{history_hash}:{user_prompt}"
     cache_key = hashlib.sha256(key_components.encode('utf-8')).hexdigest()
     return cache_key
 
-# Function to remove timestamps from the assistant's response
+# Function to remove timestamps from the character's response
 def remove_timestamps_from_response(response):
     """Remove timestamps at the beginning of the response."""
     # Remove timestamps like '[20-10-2024 13:45] ' at the beginning of the response
     return re.sub(r'^\[\d{2}-\d{2}-\d{4} \d{2}:\d{2}\]\s*', '', response)
+
+# Function to remove leading character name from the response
+def remove_leading_name_from_response(response, name):
+    """Remove leading 'Name: ' from response if present."""
+    pattern = rf'^{re.escape(name)}:\s*'
+    return re.sub(pattern, '', response, count=1)
 
 # Unified System Prompt Including All Characters
 def load_all_character_prompts():
@@ -215,15 +221,17 @@ def get_existing_sessions():
     logger.debug(f"Existing sessions: {session_ids}")
     return session_ids
 
-# Function to extract character name from file
+# Function to extract character name from file or prompt
 def get_character_name(character_file_or_prompt):
     """Extract character name from character file name or prompt."""
     if isinstance(character_file_or_prompt, str):
         if character_file_or_prompt.endswith('.txt'):
             return os.path.splitext(character_file_or_prompt)[0]
         else:
-            # If it's a prompt, try to extract the name from "You are [Name]" pattern
+            # If it's a prompt, try to extract the name from "You are [Name]" or "[Name], ..." pattern
             match = re.search(r"You are (\w+)", character_file_or_prompt)
+            if not match:
+                match = re.search(r"^(\w+),\s*", character_file_or_prompt)
             if match:
                 return match.group(1)
     return "Assistant"  # Default name if extraction fails
@@ -358,7 +366,7 @@ def reset_chat(session_id):
     )
 
 # Function to handle user input
-def respond(user_input, history, summary, session_id):
+def respond(user_input, history, summary, session_id, assistant_character):
     """Handle user input and append it to the chat history."""
     logger.debug(f"User input: {user_input}")
     # Check for empty user input
@@ -369,7 +377,8 @@ def respond(user_input, history, summary, session_id):
             history,                                               # history
             summary,                                               # summary
             gr.update(value=''),                                  # user_input
-            session_id                                             # session_id state
+            session_id,                                            # session_id state
+            assistant_character                                    # assistant_character state
         )
 
     if not session_id:
@@ -379,7 +388,8 @@ def respond(user_input, history, summary, session_id):
             history,                                               # history
             summary,                                               # summary
             gr.update(value=''),                                  # user_input
-            session_id                                             # session_id state
+            session_id,                                            # session_id state
+            assistant_character                                    # assistant_character state
         )
 
     # Append user message to history with 'User' as the name and current timestamp
@@ -397,43 +407,50 @@ def respond(user_input, history, summary, session_id):
 
     # Generate response from LLM
     character_prompts = load_all_character_prompts()
-    response = generate_response_with_llm(user_input, history, summary, character_prompts, MODEL_NAME)
+    character_name = "Assistant"  # Default name if not found; adjust as needed
+    character_prompt = ""
+
+    if assistant_character:
+        character_name = get_character_name(assistant_character)
+        character_prompt = character_prompts.get(character_name, "")
+    elif character_prompts:
+        # If no assistant character is selected, default to the first character
+        character_name = next(iter(character_prompts))
+        character_prompt = character_prompts[character_name]
+    else:
+        logger.warning("No character prompts available. Using default 'Assistant'.")
+        character_prompt = ""
+
+    response = generate_response_with_llm(user_input, history, summary, character_prompt, MODEL_NAME)
 
     if not response:
         response = "I'm sorry, I couldn't process your request."
     else:
         response = remove_timestamps_from_response(response)
+        response = remove_leading_name_from_response(response, character_name)
 
-    # Append assistant message to history
+    # Append character message to history
     assistant_message = {
         "role": "assistant",
         "content": response,
-        "name": "Assistant",
+        "name": character_name,
         "timestamp": timestamp
     }
     history.append(assistant_message)
 
-    # Store the updated session data with the assistant's response
+    # Store the updated session data with the character's response
     store_session_data(session_id, history, summary)
-    logger.debug("Assistant response stored in session data.")
+    logger.debug("Character response stored in session data.")
 
     return (
         gr.update(value=format_history_for_display(history)),  # chatbot
         history,                                               # history
         summary,                                               # summary
         gr.update(value=''),                                  # user_input
-        session_id                                             # session_id state
+        session_id,                                            # session_id state
+        assistant_character                                    # assistant_character state
     )
     
-# Message queue for auto chat
-message_queue = queue.Queue()
-
-# Global state to control auto mode
-auto_mode_active = False
-selected_characters_global = []
-session_id_global = None
-auto_chat_thread = None
-
 # Function to start auto chat
 def start_auto_chat(selected_characters, session_id):
     """Start the auto chat thread."""
@@ -493,41 +510,35 @@ def auto_chat():
             elif history and history[-1]['role'] == 'user':
                 user_prompt = history[-1]['content']
             else:
-                user_prompt = "Hello"
+                # No history, instruct LLM to start the conversation
+                user_prompt = ""
 
-            # Make decision to participate
-            decision = generate_response_with_llm(user_prompt, history, summary, current_character_prompt, MODEL_NAME, is_decision=True)
-            logger.debug(f"Decision response from LLM for {current_character_name}: {decision}")
-            decision = decision.lower().strip()
+            # Generate response
+            response = generate_response_with_llm(user_prompt, history, summary, current_character_prompt, MODEL_NAME)
 
-            if 'yes' in decision:
-                # Generate response
-                response = generate_response_with_llm(user_prompt, history, summary, current_character_prompt, MODEL_NAME)
-
-                logger.debug(f"Generated response from LLM for {current_character_name}: {response}")
-                if not response:
-                    response = "I'm sorry, I couldn't process your request."
-                else:
-                    response = remove_timestamps_from_response(response)
-
-                # Get current timestamp
-                timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
-
-                # Append messages with speaker's name and timestamp
-                assistant_message = {
-                    "role": "assistant",
-                    "content": f"{response}",
-                    "name": current_character_name,
-                    "timestamp": timestamp
-                }
-                history.append(assistant_message)
-
-                # Put the new message into the queue
-                message_queue.put(assistant_message)
-
-                logger.debug(f"{current_character_name} contributed to the conversation.")
+            logger.debug(f"Generated response from LLM for {current_character_name}: {response}")
+            if not response:
+                response = "I'm sorry, I couldn't process your request."
             else:
-                logger.debug(f"{current_character_name} decided to pass their turn.")
+                response = remove_timestamps_from_response(response)
+                response = remove_leading_name_from_response(response, current_character_name)
+
+            # Get current timestamp
+            timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
+
+            # Append messages with speaker's name and timestamp
+            assistant_message = {
+                "role": "assistant",
+                "content": response,
+                "name": current_character_name,
+                "timestamp": timestamp
+            }
+            history.append(assistant_message)
+
+            # Put the new message into the queue
+            message_queue.put(assistant_message)
+
+            logger.debug(f"{current_character_name} contributed to the conversation.")
 
             # Check if context exceeds maximum length and summarize if necessary
             context_length = len(json.dumps(history))
@@ -549,12 +560,6 @@ def auto_chat():
         logger.error(f"Exception in auto_chat thread: {e}")
         logger.debug(traceback.format_exc())
         auto_mode_active = False  # Ensure the flag is reset on exception
-    # Start the auto chat thread
-    auto_chat_thread = threading.Thread(target=auto_chat, daemon=True)
-    auto_chat_thread.start()
-    logger.info("Auto chat thread started.")
-
-    return []  # No outputs
 
 # Function to stop auto chat
 def stop_auto_chat():
@@ -624,18 +629,18 @@ def summarize_history(history, summary, system_prompt, model, num_recent=DEFAULT
     return summary.strip()
 
 # Function to generate a response from the LLM
-def generate_response_with_llm(user_prompt: str, history: list, summary: str, character_prompt: str, model: str, is_decision: bool = False) -> str:
+def generate_response_with_llm(user_prompt: str, history: list, summary: str, character_prompt: str, model: str) -> str:
     """
     Generate a response from the LLM based on the prompt, context (history), and memory (summary).
     This function interacts with the Ollama API, uses proper message formatting, and leverages caching.
-    It sends a system message and a single user message containing the conversation history.
+    It sends a system message and a single user message containing the conversation history or instructions to start the conversation.
     """
     logger.debug(f"Entered generate_response_with_llm with prompt size {len(user_prompt)}")
     global cache
 
     character_name = get_character_name(character_prompt)
 
-    cache_key = generate_cache_key(user_prompt, history, summary, character_prompt, model, is_decision)
+    cache_key = generate_cache_key(user_prompt, history, summary, character_prompt, model)
     logger.debug(f"Generated cache key: {cache_key}")
     # Attempt to fetch from cache
     with cache_lock:
@@ -647,39 +652,43 @@ def generate_response_with_llm(user_prompt: str, history: list, summary: str, ch
 
     # If not cached, call the LLM API
     try:
-        # Format the conversation history
-        conversation_history = ""
-        for message in history:
-            if message['role'] in ['user', 'assistant']:
-                timestamp = message.get('timestamp', '')
-                name = message.get('name', 'Unknown')
-                content = message.get('content', '')
-                conversation_history += f"[{timestamp}] {name}: {content}\n"
+        # Determine if there is conversation history
+        has_history = any(msg['role'] in ['user', 'assistant'] for msg in history)
 
-        # Construct the user message with history and instruction
-        if is_decision:
+        if has_history:
+            # Format the conversation history
+            conversation_history = ""
+            for message in history:
+                if message['role'] in ['user', 'assistant']:
+                    timestamp = message.get('timestamp', '')
+                    name = message.get('name', 'Unknown')
+                    content = message.get('content', '')
+                    conversation_history += f"[{timestamp}] {name}: {content}\n"
+
+            # Construct the user message with history and instruction
             full_user_prompt = f"""
-The conversation so far is:
-
-{conversation_history}
-
-As {character_name}, based on your personality and the conversation context, do you want to contribute to the conversation? Respond only with 'yes' if you want to say something, or only with 'no' if you want to pass. The default is 'yes'.
-"""
-        else:
-            full_user_prompt = f"""
+===
 Conversation history:
 
 {conversation_history}
-
-As {character_name}, respond to the latest message:
-
-{user_prompt}
+===
+As {character_name}, respond to the latest message in a single line using the conversation history for context and guidance.
 
 Guidelines:
 1. Stay in character as {character_name}.
-2. Use Markdown for formatting (e.g., **bold**, *italic*, `code`).
-3. Describe appearances, feelings, or thoughts using square brackets [like this].
+2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).
+3. On your turn, you can choose to either just describe your feelings and actions or also speak.
 4. Keep responses concise yet engaging.
+"""
+        else:
+            # No history, instruct LLM to start the conversation
+            full_user_prompt = f"""
+As {character_name}, start a conversation with the user.
+
+Guidelines:
+1. Stay in character as {character_name}.
+2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).
+3. Keep responses concise yet engaging.
 """
 
         messages = [
@@ -754,7 +763,7 @@ Guidelines:
         
 # Main function to set up Gradio interface
 def main():
-    global cache, session_id_global
+    global cache, session_id_global, selected_characters_global
     try:
         # Initialize the SQLite DB
         init_db()
@@ -787,6 +796,7 @@ def main():
             session_id = gr.State(None)
             history = gr.State([])
             summary = gr.State("")
+            assistant_character = gr.State(None)  # State for assistant character
 
             with gr.Row():
                 session_id_dropdown = gr.Dropdown(
@@ -807,6 +817,15 @@ def main():
                 start_auto_button = gr.Button("Start Auto Chat")
                 stop_auto_button = gr.Button("Stop Auto Chat")
 
+            # Assistant character selection
+            with gr.Row():
+                assistant_character_dropdown = gr.Dropdown(
+                    choices=character_files,
+                    label="Select Assistant Character",
+                    value=None,
+                    interactive=True
+                )
+
             # Initialize Chatbot with 'messages' type
             chatbot = gr.Chatbot(value=[], type='messages')
             user_input = gr.Textbox(label="Your Message", placeholder="Type your message here and press Enter")
@@ -826,31 +845,45 @@ def main():
                         [],
                         "",
                         "**Current Date & Time:** N/A",
-                        None  # Update session_id state to None
+                        None,  # Update assistant_character state to None
+                        None   # Update session_id state to None
                     )
                 history_value, summary_value = retrieve_session_data(session_id_value)
                 history_value = add_name_to_history(history_value)
                 formatted_history = format_history_for_display(history_value)
                 character_info = update_character_info()
+
+                # Attempt to determine the assistant character from history
+                assistant_char = None
+                for msg in reversed(history_value):
+                    if msg['role'] == 'assistant':
+                        assistant_char = msg.get('name', None)
+                        break
+
+                if not assistant_char and character_prompts:
+                    # If no assistant character found in history, default to the first character
+                    assistant_char = next(iter(character_prompts))
+
                 return (
                     gr.update(value=formatted_history),
                     history_value,
                     summary_value,
                     character_info,
-                    session_id_value  # Update session_id state
+                    assistant_char,          # Update assistant_character state
+                    session_id_value         # Update session_id state
                 )
 
             session_id_dropdown.change(
                 on_session_change,
                 inputs=session_id_dropdown,
-                outputs=[chatbot, history, summary, character_info_display, session_id]
+                outputs=[chatbot, history, summary, character_info_display, assistant_character, session_id]
             )
 
             # Handle user input submission
             user_input.submit(
                 respond,
-                inputs=[user_input, history, summary, session_id],
-                outputs=[chatbot, history, summary, user_input, session_id]
+                inputs=[user_input, history, summary, session_id, assistant_character],
+                outputs=[chatbot, history, summary, user_input, session_id, assistant_character]
             )
 
             # Create new session
@@ -895,6 +928,17 @@ def main():
                 outputs=[chatbot, history, summary]
             )
 
+            # Assistant character selection
+            def on_assistant_character_change(assistant_char_value):
+                logger.debug(f"Assistant character changed to: {assistant_char_value}")
+                return assistant_char_value
+
+            assistant_character_dropdown.change(
+                on_assistant_character_change,
+                inputs=assistant_character_dropdown,
+                outputs=assistant_character
+            )
+
             # On app load, load existing sessions and set default session if available
             def load_default_session():
                 existing_sessions = get_existing_sessions()
@@ -914,20 +958,32 @@ def main():
                 formatted_history = format_history_for_display(history_value)
                 # Update character info display
                 character_info = update_character_info()
-                # Return components, including session_id state
+
+                # Determine assistant character from history
+                assistant_char = None
+                for msg in reversed(history_value):
+                    if msg['role'] == 'assistant':
+                        assistant_char = msg.get('name', None)
+                        break
+
+                if not assistant_char and character_prompts:
+                    # If no assistant character found in history, default to the first character
+                    assistant_char = next(iter(character_prompts))
+
                 return (
                     gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
                     gr.update(value=formatted_history),                              # chatbot
                     history_value,                                                  # history state
                     summary_value,                                                  # summary state
                     character_info,                                                 # character_info_display
+                    assistant_char,                                                 # assistant_character state
                     selected_session_id                                             # session_id state
                 )
 
             demo.load(
                 load_default_session,
                 inputs=None,
-                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, session_id]
+                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character, session_id]
             )
 
         logger.info("Launching Gradio app.")
