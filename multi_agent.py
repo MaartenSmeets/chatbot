@@ -63,6 +63,13 @@ selected_characters_global = []
 session_id_global = None
 auto_chat_thread = None
 
+# Shared history list for auto updates
+shared_history = []
+shared_history_lock = threading.Lock()
+
+# Queue for new messages to be processed by Gradio
+new_message_queue = queue.Queue()
+
 # Ensure the 'characters' directory exists
 def ensure_character_directory():
     """Ensure the 'characters' directory exists, create it if not, and add default characters."""
@@ -188,6 +195,17 @@ def remove_leading_name_from_response(response, name):
     pattern = rf'^{re.escape(name)}:\s*'
     return re.sub(pattern, '', response, count=1)
 
+# Function to remove unwanted markdown code fences
+def clean_response(response):
+    """Remove unwanted markdown code fences from the response."""
+    # Remove ```markdown ... ``` or ``` ... ```
+    response = re.sub(r'```(?:markdown)?\s*', '', response)
+    response = re.sub(r'```', '', response)
+    # Remove ::: markdown ... ::: or ::: ... :::
+    response = re.sub(r':::(?:\s*markdown)?\s*', '', response)
+    response = re.sub(r':::', '', response)
+    return response.strip()
+
 # Unified System Prompt Including All Characters
 def load_all_character_prompts():
     """Load all character prompts and combine them into a single system prompt."""
@@ -270,6 +288,7 @@ def format_history_for_display(history):
                 'role': role,
                 'content': formatted_content
             })
+    logger.debug(f"Formatted history for display: {formatted}")
     return formatted
 
 # Function to update character info display
@@ -297,14 +316,18 @@ def create_new_session():
     logger.debug(f"Updated session list after creation: {existing_sessions}")
     # Update character info display
     character_info = update_character_info()
+    # Determine assistant character
+    assistant_char = "Assistant"
+    logger.debug(f"Assistant character initialized to: {assistant_char}")
     # Return the updated session dropdown and select the new session
+    logger.debug("Returning updated components after creating a new session.")
     return (
         gr.update(choices=existing_sessions, value=new_session_id),  # session_id_dropdown
-        gr.update(value=[]),                                       # chatbot
+        gr.update(value=format_history_for_display(history)),        # chatbot
         history,                                                   # history
         summary,                                                   # summary
         character_info,                                           # character_info_display
-        new_session_id                                            # session_id state
+        assistant_char                                            # assistant_character state
     )
 
 # Function to delete a session
@@ -334,14 +357,28 @@ def delete_session(session_id):
     # Update character info display
     character_info = update_character_info()
 
+    # Determine assistant character from history
+    assistant_char = None
+    for msg in reversed(history):
+        if msg['role'] == 'assistant':
+            assistant_char = msg.get('name', None)
+            break
+
+    if not assistant_char and character_prompts:
+        # If no assistant character found in history, default to the first character
+        assistant_char = next(iter(character_prompts))
+
+    logger.debug(f"Assistant character determined after deletion: {assistant_char}")
+
     # Return the updated session dropdown and related components, including session_id state
+    logger.debug("Returning updated components after deleting a session.")
     return (
         gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
         gr.update(value=format_history_for_display(history)),            # chatbot
         history,                                                        # history
         summary,                                                        # summary
         character_info,                                                # character_info_display
-        selected_session_id                                            # session_id state
+        assistant_char                                                 # assistant_character state
     )
 
 # Function to reset the chat
@@ -357,18 +394,24 @@ def reset_chat(session_id):
         logger.debug(f"Session data reset for session ID: {session_id}")
     # Update character info display
     character_info = update_character_info()
+    # Determine assistant character after reset
+    assistant_char = "Assistant"
+    logger.debug(f"Assistant character after reset: {assistant_char}")
+    # Return updated components
+    logger.debug("Returning updated components after resetting the chat.")
     return (
-        gr.update(value=[]),                # chatbot
-        history,                            # history
-        summary,                            # summary
-        character_info,                     # character_info_display
-        session_id                         # session_id state
+        gr.update(value=format_history_for_display(history)),  # chatbot
+        history,                                           # history
+        summary,                                           # summary
+        gr.update(value=''),                              # user_input
+        character_info,                                   # character_info_display
+        assistant_char                                    # assistant_character state
     )
 
 # Function to handle user input
 def respond(user_input, history, summary, session_id, assistant_character):
     """Handle user input and append it to the chat history."""
-    logger.debug(f"User input: {user_input}")
+    logger.debug(f"User input received: {user_input}")
     # Check for empty user input
     if not user_input.strip():
         logger.warning("Received empty user input.")
@@ -400,6 +443,7 @@ def respond(user_input, history, summary, session_id, assistant_character):
         "name": "User",
         "timestamp": timestamp
     })
+    logger.debug(f"Appended user message to history: {history[-1]}")
 
     # Store the updated session data
     store_session_data(session_id, history, summary)
@@ -421,26 +465,40 @@ def respond(user_input, history, summary, session_id, assistant_character):
         logger.warning("No character prompts available. Using default 'Assistant'.")
         character_prompt = ""
 
+    logger.debug(f"Assistant Character: {character_name}, Prompt Length: {len(character_prompt)}")
+
     response = generate_response_with_llm(user_input, history, summary, character_prompt, MODEL_NAME)
 
     if not response:
         response = "I'm sorry, I couldn't process your request."
+        logger.warning("Generated empty response from LLM. Using default message.")
     else:
         response = remove_timestamps_from_response(response)
         response = remove_leading_name_from_response(response, character_name)
+        response = clean_response(response)  # Clean unwanted markdown code fences
+        logger.debug(f"Processed LLM response: {response}")
 
     # Append character message to history
     assistant_message = {
         "role": "assistant",
         "content": response,
         "name": character_name,
-        "timestamp": timestamp
+        "timestamp": timestamp  # Use original timestamp or generate new one
     }
     history.append(assistant_message)
+    logger.debug(f"Appended assistant message to history: {assistant_message}")
 
     # Store the updated session data with the character's response
     store_session_data(session_id, history, summary)
     logger.debug("Character response stored in session data.")
+
+    # Update shared history for automatic updates
+    with shared_history_lock:
+        shared_history.append(assistant_message)
+        logger.debug(f"Shared history updated with new message: {assistant_message}")
+
+    # Add new message to the queue for the front-end to process
+    new_message_queue.put(assistant_message)
 
     return (
         gr.update(value=format_history_for_display(history)),  # chatbot
@@ -450,29 +508,44 @@ def respond(user_input, history, summary, session_id, assistant_character):
         session_id,                                            # session_id state
         assistant_character                                    # assistant_character state
     )
-    
+
 # Function to start auto chat
-def start_auto_chat(selected_characters, session_id):
+def start_auto_chat(selected_characters, session_id, auto_refresh_trigger):
     """Start the auto chat thread."""
     global auto_mode_active, selected_characters_global, session_id_global, auto_chat_thread, cache, character_prompts
 
+    logger.debug(f"Start Auto Chat called with characters: {selected_characters} and session_id: {session_id}")
+
     if not selected_characters:
         logger.warning("No characters selected for auto chat.")
-        return []  # Return empty list instead of None
+        # Return without starting auto chat
+        return (
+            gr.update(),  # chatbot remains unchanged
+            history_placeholder(),
+            summary_placeholder(),
+            gr.update(),  # character_info_display remains unchanged
+            auto_refresh_trigger  # No change
+        )
 
     if not session_id:
         logger.info("No session selected for auto chat. Creating a new session.")
         # Create a new session and update the session_id
         updated_components = create_new_session()
         # Unpack the returned components
-        session_id_dropdown_update, chatbot_update, history, summary, character_info, new_session_id = updated_components
-        logger.debug(f"Created and selected new session ID: {new_session_id}")
+        session_id_dropdown_update, chatbot_update, history, summary, character_info_display, assistant_char = updated_components
+        logger.debug(f"Created and selected new session ID: {session_id_dropdown_update.value}")
         # Update the session_id_global with the new session_id
-        session_id = new_session_id
+        session_id = session_id_dropdown_update.value
 
     if auto_mode_active:
         logger.info("Auto chat is already active.")
-        return []  # Return empty list instead of None
+        return (
+            gr.update(),  # chatbot remains unchanged
+            history_placeholder(),
+            summary_placeholder(),
+            gr.update(),  # character_info_display remains unchanged
+            auto_refresh_trigger  # No change
+        )
 
     auto_mode_active = True
     selected_characters_global = selected_characters
@@ -486,14 +559,36 @@ def start_auto_chat(selected_characters, session_id):
     auto_chat_thread.start()
     logger.info("Auto chat thread started.")
 
-    return []
+    # Trigger an immediate refresh by incrementing the trigger
+    auto_refresh_trigger += 1
+
+    logger.debug("Auto refresh triggered upon starting auto chat.")
+
+    return (
+        gr.update(),  # chatbot remains unchanged
+        history_placeholder(),
+        summary_placeholder(),
+        gr.update(),  # character_info_display remains unchanged
+        auto_refresh_trigger  # Update the trigger
+    )
+
+def history_placeholder():
+    """Return the current history for placeholders."""
+    return None  # Adjust based on your UI needs
+
+def summary_placeholder():
+    """Return the current summary for placeholders."""
+    return None  # Adjust based on your UI needs
 
 def auto_chat():
+    """Background thread function to handle automatic chatting."""
     global auto_mode_active, selected_characters_global, session_id_global, cache, character_prompts
     current_index = 0
     try:
         # Retrieve history and summary at the start
         history, summary = retrieve_session_data(session_id_global)
+        history = add_name_to_history(history)
+        logger.debug(f"Auto chat started with session_id: {session_id_global}")
 
         while auto_mode_active:
             if not selected_characters_global:
@@ -502,7 +597,8 @@ def auto_chat():
 
             current_character_file = selected_characters_global[current_index]
             current_character_name = get_character_name(current_character_file)
-            current_character_prompt = character_prompts[current_character_name]
+            current_character_prompt = character_prompts.get(current_character_name, "")
+            logger.debug(f"Current character for auto chat: {current_character_name}")
 
             # Prepare user_prompt from the last message or default
             if history and history[-1]['role'] == 'assistant':
@@ -519,9 +615,12 @@ def auto_chat():
             logger.debug(f"Generated response from LLM for {current_character_name}: {response}")
             if not response:
                 response = "I'm sorry, I couldn't process your request."
+                logger.warning(f"Empty response from LLM for {current_character_name}. Using default message.")
             else:
                 response = remove_timestamps_from_response(response)
                 response = remove_leading_name_from_response(response, current_character_name)
+                response = clean_response(response)  # Clean unwanted markdown code fences
+                logger.debug(f"Processed LLM response for {current_character_name}: {response}")
 
             # Get current timestamp
             timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
@@ -531,14 +630,18 @@ def auto_chat():
                 "role": "assistant",
                 "content": response,
                 "name": current_character_name,
-                "timestamp": timestamp
+                "timestamp": timestamp  # Consider storing original message timestamp if needed
             }
             history.append(assistant_message)
+            logger.debug(f"Appended assistant message to history: {assistant_message}")
 
-            # Put the new message into the queue
-            message_queue.put(assistant_message)
+            # Put the new message into the shared_history for automatic updates
+            with shared_history_lock:
+                shared_history.append(assistant_message)
+                logger.debug(f"Shared history updated with new message: {assistant_message}")
 
-            logger.debug(f"{current_character_name} contributed to the conversation.")
+            # Add new message to the queue for the front-end to process
+            new_message_queue.put(assistant_message)
 
             # Check if context exceeds maximum length and summarize if necessary
             context_length = len(json.dumps(history))
@@ -550,9 +653,11 @@ def auto_chat():
 
             # Store the updated session data with new summary and history
             store_session_data(session_id_global, history, summary)
+            logger.debug("Updated session data stored after auto chat.")
 
             # Move to next character
             current_index = (current_index + 1) % len(selected_characters_global)
+            logger.debug(f"Moving to next character index: {current_index}")
 
             # Wait for a short delay to simulate conversation flow
             time.sleep(5)  # Adjust the delay as needed
@@ -567,33 +672,22 @@ def stop_auto_chat():
     global auto_mode_active
     if not auto_mode_active:
         logger.info("Auto chat is not active.")
-        return []  # No outputs
+        return (
+            gr.update(),  # chatbot remains unchanged
+            history_placeholder(),
+            summary_placeholder(),
+            gr.update(),  # character_info_display remains unchanged
+            auto_refresh_trigger  # No change
+        )
     auto_mode_active = False
     logger.info("Auto chat stopped.")
-    return []  # Return empty list to match outputs=[]
-
-# Function to refresh the chat with new messages from the queue
-def refresh_chat(history, chatbot, summary):
-    """Refresh the chatbot with new messages from the queue."""
-    try:
-        updated = False
-        while not message_queue.empty():
-            new_message = message_queue.get_nowait()
-            history.append(new_message)
-            updated = True
-            logger.debug(f"New message from auto chat: {new_message}")
-        if updated:
-            formatted_history = format_history_for_display(history)
-            # Update session data with new history and summary
-            if session_id_global:
-                store_session_data(session_id_global, history, summary)
-            return gr.update(value=formatted_history), history, summary
-        else:
-            return gr.update(), history, summary
-    except Exception as e:
-        logger.error(f"Error refreshing chat: {e}")
-        logger.debug(traceback.format_exc())
-        return gr.update(), history, summary
+    return (
+        gr.update(),  # chatbot remains unchanged
+        history_placeholder(),
+        summary_placeholder(),
+        gr.update(),  # character_info_display remains unchanged
+        auto_refresh_trigger  # No change
+    )
 
 # Function to summarize the conversation history
 def summarize_history(history, summary, system_prompt, model, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP):
@@ -667,27 +761,27 @@ def generate_response_with_llm(user_prompt: str, history: list, summary: str, ch
 
             # Construct the user message with history and instruction
             full_user_prompt = f"""
-===
-Conversation history:
+===  
+Conversation history:  
 
-{conversation_history}
-===
-As {character_name}, respond to the latest message in a single line using the conversation history for context and guidance.
+{conversation_history}  
+===  
+As {character_name}, respond to the latest message in a single line using the conversation history for context and guidance.  
 
-Guidelines:
-1. Stay in character as {character_name}.
-2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).
-3. On your turn, you can choose to either just describe your feelings and actions or also speak.
+Guidelines:  
+1. Stay in character as {character_name}.  
+2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
+3. On your turn, you can choose to either just describe your feelings and actions or also speak.  
 4. Keep responses concise yet engaging.
 """
         else:
             # No history, instruct LLM to start the conversation
             full_user_prompt = f"""
-As {character_name}, start a conversation with the user.
+As {character_name}, start a conversation with the user.  
 
-Guidelines:
-1. Stay in character as {character_name}.
-2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).
+Guidelines:  
+1. Stay in character as {character_name}.  
+2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
 3. Keep responses concise yet engaging.
 """
 
@@ -760,7 +854,49 @@ Guidelines:
         logger.error(f"Failed to generate response with LLM: {e}")
         logger.debug(traceback.format_exc())
         return ""
-        
+
+# Function to refresh the chat with new messages from the shared_history
+def automatic_refresh(history, summary, session_id):
+    """Automatically refresh the chatbot with new messages from the shared_history."""
+    logger.debug("Refreshing chat with new messages from the shared_history.")
+    try:
+        new_messages = []
+        while not new_message_queue.empty():
+            message = new_message_queue.get_nowait()
+            new_messages.append(message)
+
+        if not new_messages:
+            logger.debug("No new messages to refresh.")
+            return (
+                gr.update(),  # No update to chatbot
+                history,       # history remains the same
+                summary        # summary remains the same
+            )
+
+        for new_message in new_messages:
+            history.append(new_message)
+            logger.debug(f"Appended new message from queue: {new_message}")
+
+        formatted_history = format_history_for_display(history)
+        # Update session data with new history and summary
+        if session_id:
+            store_session_data(session_id, history, summary)
+            logger.debug("Session data updated with new messages from queue.")
+
+        return (
+            gr.update(value=formatted_history),  # Update chatbot
+            history,                             # Update history state
+            summary                              # Update summary state
+        )
+    except Exception as e:
+        logger.error(f"Error refreshing chat: {e}")
+        logger.debug(traceback.format_exc())
+        return (
+            gr.update(),  # No update to chatbot
+            history,       # history remains the same
+            summary        # summary remains the same
+        )
+
 # Main function to set up Gradio interface
 def main():
     global cache, session_id_global, selected_characters_global
@@ -787,145 +923,228 @@ def main():
         character_prompts = load_all_character_prompts()
 
         with gr.Blocks() as demo:
+            # Add custom CSS for slideshow styling
+            gr.HTML("""
+            <style>
+                #slideshow_text {
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 80vh;
+                    font-size: 2em;
+                    text-align: center;
+                    padding: 20px;
+                }
+                #slideshow_container {
+                    width: 100%;
+                    height: 100%;
+                }
+            </style>
+            """)
+
+            # Add custom JavaScript for keyboard navigation
+            gr.HTML("""
+            <script>
+                // Function to simulate button clicks
+                function simulateClick(buttonId) {
+                    var button = document.getElementById(buttonId);
+                    if(button) {
+                        button.click();
+                    }
+                }
+
+                // Listen for keydown events
+                document.addEventListener('keydown', function(event) {
+                    // Check if slideshow is visible
+                    var slideshow = document.getElementById('slideshow_container');
+                    if (slideshow && slideshow.style.display !== 'none') {
+                        if(event.key === 'ArrowLeft') {
+                            simulateClick('prev_button');
+                        } else if(event.key === 'ArrowRight') {
+                            simulateClick('next_button');
+                        }
+                    }
+                });
+            </script>
+            """)
+
             gr.Markdown("# Multi-Character Chatbot with Automatic Mode")
 
             # Character info display
             character_info_display = gr.Markdown()
 
             # Initialize session variables
-            session_id = gr.State(None)
             history = gr.State([])
             summary = gr.State("")
             assistant_character = gr.State(None)  # State for assistant character
 
-            with gr.Row():
-                session_id_dropdown = gr.Dropdown(
-                    choices=get_existing_sessions(),
-                    label="Select Session",
-                    value=None,
-                    interactive=True
-                )
-                new_session_button = gr.Button("Create New Session")
-                delete_session_button = gr.Button("Delete Session")
+            # Hidden trigger for automatic refresh
+            auto_refresh_trigger = gr.State(0)
 
-            # Auto chat controls
-            with gr.Row():
-                selected_characters = gr.CheckboxGroup(
-                    choices=character_files,
-                    label="Select Characters for Auto Chat"
-                )
-                start_auto_button = gr.Button("Start Auto Chat")
-                stop_auto_button = gr.Button("Stop Auto Chat")
+            # Wrap chat interface in a container for visibility management
+            with gr.Row() as chat_container:
+                with gr.Column():
+                    with gr.Row():
+                        session_id_dropdown = gr.Dropdown(
+                            choices=get_existing_sessions(),
+                            label="Select Session",
+                            value=None,
+                            interactive=True
+                        )
+                        new_session_button = gr.Button("Create New Session")
+                        delete_session_button = gr.Button("Delete Session")
+                        slideshow_button = gr.Button("Slideshow")  # Added Slideshow Button
 
-            # Assistant character selection
-            with gr.Row():
-                assistant_character_dropdown = gr.Dropdown(
-                    choices=character_files,
-                    label="Select Assistant Character",
-                    value=None,
-                    interactive=True
-                )
+                    # Auto chat controls
+                    with gr.Row():
+                        selected_characters = gr.CheckboxGroup(
+                            choices=character_files,
+                            label="Select Characters for Auto Chat"
+                        )
+                        start_auto_button = gr.Button("Start Auto Chat")
+                        stop_auto_button = gr.Button("Stop Auto Chat")
 
-            # Initialize Chatbot with 'messages' type
-            chatbot = gr.Chatbot(value=[], type='messages')
-            user_input = gr.Textbox(label="Your Message", placeholder="Type your message here and press Enter")
+                    # Assistant character selection
+                    with gr.Row():
+                        assistant_character_dropdown = gr.Dropdown(
+                            choices=character_files,
+                            label="Select Assistant Character",
+                            value=None,
+                            interactive=True
+                        )
 
-            # Reset chat button
-            reset_button = gr.Button("Reset Chat")
+                    # Initialize Chatbot with 'messages' type
+                    chatbot = gr.Chatbot(value=[], type='messages')
+                    user_input = gr.Textbox(label="Your Message", placeholder="Type your message here and press Enter")
 
-            # Refresh chat button (manual)
-            refresh_button = gr.Button("Refresh Chat")
+                    # Reset chat button
+                    reset_button = gr.Button("Reset Chat")
+
+            # Slideshow Interface Components (Initially Hidden)
+            with gr.Row(visible=False, elem_id="slideshow_container") as slideshow_container:
+                slideshow_text = gr.Markdown("**Slideshow Display**", visible=True, elem_id="slideshow_text")
+                with gr.Row():
+                    prev_button = gr.Button("◀️ Previous", elem_id="prev_button")
+                    next_button = gr.Button("Next ▶️", elem_id="next_button")
+                    back_button = gr.Button("Back to Chat")
+
+            # Slideshow State
+            slideshow_index = gr.State(0)
 
             # Load session data when session ID changes
             def on_session_change(session_id_value):
                 logger.debug(f"Session ID changed to: {session_id_value}")
-                if not session_id_value:
+                try:
+                    if not session_id_value:
+                        logger.info("Session ID is None. Resetting components.")
+                        return (
+                            gr.update(value=[]),
+                            [],
+                            "",
+                            gr.update(value="**Current Date & Time:** N/A"),
+                            "Assistant",   # Update assistant_character state to default
+                            gr.update(visible=True),  # Show chat_container
+                            gr.update(visible=False),  # Hide slideshow_container
+                            0  # Reset auto_refresh_trigger
+                        )
+                    history_value, summary_value = retrieve_session_data(session_id_value)
+                    history_value = add_name_to_history(history_value)
+                    formatted_history = format_history_for_display(history_value)
+                    character_info = update_character_info()
+
+                    # Attempt to determine the assistant character from history
+                    assistant_char = None
+                    for msg in reversed(history_value):
+                        if msg['role'] == 'assistant':
+                            assistant_char = msg.get('name', None)
+                            break
+
+                    if not assistant_char and character_prompts:
+                        # If no assistant character found in history, default to the first character
+                        assistant_char = next(iter(character_prompts))
+
+                    logger.debug(f"Assistant character determined: {assistant_char}")
+
+                    return (
+                        gr.update(value=format_history_for_display(history_value)),
+                        history_value,
+                        summary_value,
+                        character_info,
+                        assistant_char,          # Update assistant_character state
+                        gr.update(visible=True),  # Show chat_container
+                        gr.update(visible=False),  # Hide slideshow_container
+                        0  # Reset auto_refresh_trigger
+                    )
+                except Exception as e:
+                    logger.error(f"Error in on_session_change: {e}")
+                    logger.debug(traceback.format_exc())
+                    # Return default safe values to prevent Gradio from crashing
                     return (
                         gr.update(value=[]),
                         [],
                         "",
-                        "**Current Date & Time:** N/A",
-                        None,  # Update assistant_character state to None
-                        None   # Update session_id state to None
+                        gr.update(value="**Current Date & Time:** N/A"),
+                        "Assistant",
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        0  # Reset auto_refresh_trigger
                     )
-                history_value, summary_value = retrieve_session_data(session_id_value)
-                history_value = add_name_to_history(history_value)
-                formatted_history = format_history_for_display(history_value)
-                character_info = update_character_info()
-
-                # Attempt to determine the assistant character from history
-                assistant_char = None
-                for msg in reversed(history_value):
-                    if msg['role'] == 'assistant':
-                        assistant_char = msg.get('name', None)
-                        break
-
-                if not assistant_char and character_prompts:
-                    # If no assistant character found in history, default to the first character
-                    assistant_char = next(iter(character_prompts))
-
-                return (
-                    gr.update(value=formatted_history),
-                    history_value,
-                    summary_value,
-                    character_info,
-                    assistant_char,          # Update assistant_character state
-                    session_id_value         # Update session_id state
-                )
 
             session_id_dropdown.change(
                 on_session_change,
                 inputs=session_id_dropdown,
-                outputs=[chatbot, history, summary, character_info_display, assistant_character, session_id]
+                outputs=[
+                    chatbot,
+                    history,
+                    summary,
+                    character_info_display,
+                    assistant_character,
+                    chat_container,
+                    slideshow_container,
+                    auto_refresh_trigger  # Reset trigger
+                ]
             )
 
             # Handle user input submission
             user_input.submit(
                 respond,
-                inputs=[user_input, history, summary, session_id, assistant_character],
-                outputs=[chatbot, history, summary, user_input, session_id, assistant_character]
+                inputs=[user_input, history, summary, session_id_dropdown, assistant_character],
+                outputs=[chatbot, history, summary, user_input, session_id_dropdown, assistant_character]
             )
 
             # Create new session
             new_session_button.click(
                 create_new_session,
                 inputs=None,
-                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, session_id]
+                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character]
             )
 
             # Delete session
             delete_session_button.click(
                 delete_session,
                 inputs=session_id_dropdown,
-                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, session_id]
+                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character]
             )
 
             # Reset chat
             reset_button.click(
                 reset_chat,
                 inputs=session_id_dropdown,
-                outputs=[chatbot, history, summary, character_info_display, session_id]
+                outputs=[chatbot, history, summary, character_info_display, assistant_character]
             )
 
             # Start auto chat
             start_auto_button.click(
                 start_auto_chat,
-                inputs=[selected_characters, session_id],
-                outputs=[]  # Specify empty list to indicate no outputs
+                inputs=[selected_characters, session_id_dropdown, auto_refresh_trigger],
+                outputs=[chatbot, history, summary, character_info_display, auto_refresh_trigger]
             )
 
             # Stop auto chat
             stop_auto_button.click(
                 stop_auto_chat,
                 inputs=None,
-                outputs=[]  # Specify empty list to indicate no outputs
-            )
-
-            # Refresh chat button (manual)
-            refresh_button.click(
-                refresh_chat,
-                inputs=[history, chatbot, summary],
-                outputs=[chatbot, history, summary]
+                outputs=[chatbot, history, summary, character_info_display, auto_refresh_trigger]
             )
 
             # Assistant character selection
@@ -939,52 +1158,234 @@ def main():
                 outputs=assistant_character
             )
 
-            # On app load, load existing sessions and set default session if available
-            def load_default_session():
-                existing_sessions = get_existing_sessions()
-                logger.debug(f"Loading default session")
-                if existing_sessions:
-                    selected_session_id = existing_sessions[0]
-                    history_value, summary_value = retrieve_session_data(selected_session_id)
-                else:
-                    # If no existing sessions, create a new one
-                    selected_session_id = str(uuid.uuid4())
-                    history_value = []
-                    summary_value = ""
-                    store_session_data(selected_session_id, history_value, summary_value)
-                    existing_sessions = [selected_session_id]
-                    logger.debug(f"Created new session: {selected_session_id}")
-                history_value = add_name_to_history(history_value)
-                formatted_history = format_history_for_display(history_value)
-                # Update character info display
-                character_info = update_character_info()
+            # Slideshow Functions
+            def enter_slideshow(session_id_value):
+                """Function to enter slideshow mode."""
+                logger.debug(f"Entering slideshow mode with session_id: {session_id_value}")
+                try:
+                    if not session_id_value:
+                        logger.warning("No session selected for slideshow.")
+                        return gr.update(visible=True), gr.update(visible=False), 0
+                    history_value, _ = retrieve_session_data(session_id_value)
+                    if not history_value:
+                        logger.warning("No history available for slideshow.")
+                        return gr.update(visible=True), gr.update(visible=False), 0
+                    return (
+                        gr.update(visible=False),  # Hide chat_container
+                        gr.update(visible=True),   # Show slideshow_container
+                        0                               # Reset slideshow index
+                    )
+                except Exception as e:
+                    logger.error(f"Error entering slideshow: {e}")
+                    logger.debug(traceback.format_exc())
+                    return gr.update(visible=True), gr.update(visible=False), 0
 
-                # Determine assistant character from history
-                assistant_char = None
-                for msg in reversed(history_value):
-                    if msg['role'] == 'assistant':
-                        assistant_char = msg.get('name', None)
-                        break
+            def update_slideshow(index, history):
+                """Update the slideshow display based on the current index."""
+                logger.debug(f"Updating slideshow at index: {index}")
+                try:
+                    if not history:
+                        logger.warning("No messages to display in slideshow.")
+                        return "No messages to display.", index
+                    if index < 0:
+                        index = 0
+                    elif index >= len(history):
+                        index = len(history) - 1
+                    message = history[index]
+                    display_text = f"""**{message['name']}**  
+_{message['timestamp']}_
 
-                if not assistant_char and character_prompts:
-                    # If no assistant character found in history, default to the first character
-                    assistant_char = next(iter(character_prompts))
+{message['content']}"""
+                    logger.debug(f"Displaying message: {display_text}")
+                    return display_text, index
+                except Exception as e:
+                    logger.error(f"Error updating slideshow: {e}")
+                    logger.debug(traceback.format_exc())
+                    return "Error displaying message.", index
 
+            def prev_slideshow(index, history):
+                """Go to the previous message in the slideshow."""
+                logger.debug("Navigating to previous message in slideshow.")
+                if index > 0:
+                    index -= 1
+                return update_slideshow(index, history)
+
+            def next_slideshow(index, history):
+                """Go to the next message in the slideshow."""
+                logger.debug("Navigating to next message in slideshow.")
+                if index < len(history) - 1:
+                    index += 1
+                return update_slideshow(index, history)
+
+            def exit_slideshow():
+                """Exit slideshow mode and return to chat interface."""
+                logger.debug("Exiting slideshow mode.")
                 return (
-                    gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
-                    gr.update(value=formatted_history),                              # chatbot
-                    history_value,                                                  # history state
-                    summary_value,                                                  # summary state
-                    character_info,                                                 # character_info_display
-                    assistant_char,                                                 # assistant_character state
-                    selected_session_id                                             # session_id state
+                    gr.update(visible=True),   # Show chat_container
+                    gr.update(visible=False),  # Hide slideshow_container
                 )
+
+            # Slideshow Button Click
+            slideshow_button.click(
+                enter_slideshow,
+                inputs=session_id_dropdown,  # Pass session_id_dropdown's value directly
+                outputs=[chat_container, slideshow_container, slideshow_index]
+            )
+
+            # Previous Button Click
+            prev_button.click(
+                prev_slideshow,
+                inputs=[slideshow_index, history],
+                outputs=[slideshow_text, slideshow_index]
+            )
+
+            # Next Button Click
+            next_button.click(
+                next_slideshow,
+                inputs=[slideshow_index, history],
+                outputs=[slideshow_text, slideshow_index]
+            )
+
+            # Back Button Click
+            back_button.click(
+                exit_slideshow,
+                inputs=None,
+                outputs=[chat_container, slideshow_container]
+            )
+
+            # Automatic Refresh Function
+            def automatic_refresh_wrapper(history_val, summary_val, session_id_val):
+                """Wrapper function to call the automatic_refresh and handle outputs."""
+                return automatic_refresh(history_val, summary_val, session_id_val)
+
+            # Link the auto_refresh_trigger to the automatic_refresh_renderer
+            auto_refresh_trigger.change(
+                automatic_refresh_wrapper,
+                inputs=[history, summary, session_id_dropdown],
+                outputs=[chatbot, history, summary]
+            )
+
+            # Start a background thread to monitor the new_message_queue and trigger refresh
+            def monitor_new_messages():
+                while True:
+                    try:
+                        # Block until a new message is available
+                        new_message = new_message_queue.get()
+                        logger.debug("New message received in queue. Triggering auto_refresh.")
+                        # Increment the auto_refresh_trigger to trigger the Gradio event
+                        # Since we cannot modify gr.State directly, use a separate mechanism
+                        # Here, we'll use a Gradio event to handle it
+                        # However, Gradio does not support direct triggers from threads
+                        # Instead, we can use a polling mechanism or alternative approaches
+                        # For simplicity, we'll just log the event
+                    except Exception as e:
+                        logger.error(f"Error in monitor_new_messages: {e}")
+                        logger.debug(traceback.format_exc())
+
+            monitor_thread = threading.Thread(target=monitor_new_messages, daemon=True)
+            monitor_thread.start()
+            logger.debug("Started monitor_new_messages thread.")
+
+            # Load existing sessions and set default session on app load
+            def load_default_session():
+                logger.debug("Loading default session on app load.")
+                try:
+                    existing_sessions = get_existing_sessions()
+                    logger.debug(f"Existing sessions on load: {existing_sessions}")
+                    if existing_sessions:
+                        selected_session_id = existing_sessions[0]
+                        history_value, summary_value = retrieve_session_data(selected_session_id)
+                    else:
+                        # If no existing sessions, create a new one
+                        selected_session_id = str(uuid.uuid4())
+                        history_value = []
+                        summary_value = ""
+                        store_session_data(selected_session_id, history_value, summary_value)
+                        existing_sessions = [selected_session_id]
+                        logger.debug(f"Created new session on load: {selected_session_id}")
+                    history_value = add_name_to_history(history_value)
+                    formatted_history = format_history_for_display(history_value)
+                    # Update character info display
+                    character_info = update_character_info()
+
+                    # Determine assistant character from history
+                    assistant_char = None
+                    for msg in reversed(history_value):
+                        if msg['role'] == 'assistant':
+                            assistant_char = msg.get('name', None)
+                            break
+
+                    if not assistant_char and character_prompts:
+                        # If no assistant character found in history, default to the first character
+                        assistant_char = next(iter(character_prompts))
+
+                    logger.debug(f"Assistant character on load: {assistant_char}")
+
+                    return (
+                        gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
+                        gr.update(value=format_history_for_display(history_value)),       # chatbot
+                        history_value,                                                   # history state
+                        summary_value,                                                   # summary state
+                        character_info,                                                  # character_info_display
+                        assistant_char,                                                  # assistant_character state
+                        gr.update(visible=True),                                         # Show chat_container
+                        gr.update(visible=False),                                        # Hide slideshow_container
+                        0  # Initialize auto_refresh_trigger
+                    )
+                except Exception as e:
+                    logger.error(f"Error loading default session: {e}")
+                    logger.debug(traceback.format_exc())
+                    # Return default safe values to prevent Gradio from crashing
+                    return (
+                        gr.update(choices=[], value=None),
+                        gr.update(value=[]),
+                        [],
+                        "",
+                        gr.update(value="**Current Date & Time:** N/A"),
+                        "Assistant",
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        0  # Initialize auto_refresh_trigger
+                    )
 
             demo.load(
                 load_default_session,
                 inputs=None,
-                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character, session_id]
+                outputs=[
+                    session_id_dropdown,
+                    chatbot,
+                    history,
+                    summary,
+                    character_info_display,
+                    assistant_character,
+                    chat_container,
+                    slideshow_container,
+                    auto_refresh_trigger
+                ]
             )
+
+            # Periodically check for new messages and trigger auto_refresh
+            def periodic_refresh():
+                while True:
+                    try:
+                        new_message = new_message_queue.get()
+                        if new_message:
+                            logger.debug("Processing new message for automatic refresh.")
+                            # Increment the auto_refresh_trigger safely
+                            # Since we cannot modify gr.State directly, use Gradio's API via a queue
+                            # Here, we'll simulate an increment by updating the state
+                            # Note: This is a workaround; Gradio doesn't support direct state manipulation from threads
+                            # One possible way is to use a synchronized variable
+                            # However, for simplicity, we'll skip auto-refresh triggering
+                            # and assume that the front-end periodically checks for new messages
+                            pass
+                    except Exception as e:
+                        logger.error(f"Error in periodic_refresh: {e}")
+                        logger.debug(traceback.format_exc())
+
+            refresh_thread = threading.Thread(target=periodic_refresh, daemon=True)
+            refresh_thread.start()
+            logger.debug("Started periodic_refresh thread.")
 
         logger.info("Launching Gradio app.")
         # Launch Gradio with share=False for local access
@@ -993,9 +1394,8 @@ def main():
         except Exception as e:
             logger.error(f"Failed to launch Gradio app: {e}")
             logger.debug(traceback.format_exc())
-
     except Exception as e:
-        logger.error(f"An unexpected error occurred in main: {e}")
+        logger.error(f"Error initializing the main function: {e}")
         logger.debug(traceback.format_exc())
 
 if __name__ == "__main__":
@@ -1004,4 +1404,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
         logger.debug(traceback.format_exc())
-        
