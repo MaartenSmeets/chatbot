@@ -200,7 +200,9 @@ def store_session_data(session_id, history, summary):
             VALUES (?, ?, ?)
         ''', (session_id, history_json, summary))
         conn.commit()
-    logger.debug(f"Stored session data for session_id: {session_id}")
+    
+    # Add debug log to confirm data is being stored
+    logger.debug(f"Stored session data for session_id: {session_id} with history: {history} and summary: {summary}")
 
 def retrieve_session_data(session_id):
     """Retrieve session data including history and summary from SQLite database."""
@@ -402,6 +404,19 @@ def reset_chat(session_id, character_prompts):
 # Queue for new messages to be processed by Gradio
 new_message_queue = queue.Queue()
 
+def stream_new_messages(history):
+    """Generator function to stream new messages to the chatbot front-end in real time."""
+    while True:
+        try:
+            # Get new messages from the queue, waiting if necessary
+            message = new_message_queue.get(timeout=1)  # Block until there's a message
+            formatted_message = format_history_for_display([message])  # Format message for display
+            
+            # Update the front-end by yielding formatted message to Gradio's chatbot component
+            yield gr.update(value=formatted_message)
+        except queue.Empty:
+            continue
+
 # Function to handle user input
 def respond(user_input, history, summary, session_id, assistant_character):
     """Handle user input and append it to the chat history."""
@@ -483,22 +498,15 @@ def respond(user_input, history, summary, session_id, assistant_character):
         "timestamp": timestamp
     }
     history.append(assistant_message)
+    yield gr.update(value=format_history_for_display(history))
     logger.debug(f"Appended assistant message to history: {assistant_message}")
 
     # Store the updated session data with the character's response
     store_session_data(session_id, history, summary)
     logger.debug("Character response stored in session data.")
 
-    # Add new message to the queue for the front-end to process
-    new_message_queue.put(assistant_message)
-
-    return (
-        gr.update(value=format_history_for_display(history)),  # chatbot
-        history,                                                 # history
-        summary,                                                 # summary
-        "",                                                      # user_input
-        assistant_character                                      # assistant_character state
-    )
+    # Return a stream of new messages
+    return stream_new_messages(history)
 
 # Function to start auto chat
 def start_auto_chat(selected_characters, session_id, character_prompts):
@@ -630,8 +638,10 @@ def generate_response_with_llm(user_prompt: str, history: list, summary: str, ch
 
     character_name = get_character_name(character_prompt)
 
+    # Generate a unique cache key based on the current state
     cache_key = generate_cache_key(user_prompt, history, summary, character_prompt, model)
     logger.debug(f"Generated cache key: {cache_key}")
+    
     # Attempt to fetch from cache
     with cache_lock:
         if cache and cache_key in cache:
@@ -640,13 +650,12 @@ def generate_response_with_llm(user_prompt: str, history: list, summary: str, ch
             logger.debug(f"Cached response: {response_content}")
             return response_content
 
-    # If not cached, call the LLM API
     try:
-        # Determine if there is conversation history
+        # Determine if there is valid conversation history to include
         has_history = any(msg['role'] in ['user', 'assistant'] for msg in history)
 
         if has_history:
-            # Format the conversation history
+            # Build the conversation history string from the messages
             conversation_history = ""
             for message in history:
                 if message['role'] in ['user', 'assistant']:
@@ -655,7 +664,7 @@ def generate_response_with_llm(user_prompt: str, history: list, summary: str, ch
                     content = message.get('content', '')
                     conversation_history += f"[{timestamp}] {name}: {content}\n"
 
-            # Construct the user message with history and instruction
+            # User prompt with context and guidelines
             full_user_prompt = f"""
 ===  
 Conversation history:  
@@ -671,7 +680,8 @@ Guidelines:
 4. Keep responses concise yet engaging.
 """
         else:
-            # No history, instruct LLM to start the conversation
+            # If there's no history, send a generic start-conversation prompt
+            logger.debug("No conversation history found, sending initial conversation start prompt.")
             full_user_prompt = f"""
 As {character_name}, start a conversation with the user.  
 
@@ -681,6 +691,7 @@ Guidelines:
 3. Keep responses concise yet engaging.
 """
 
+        # Prepare the system and user messages for the LLM
         messages = [
             {"role": "system", "content": character_prompt},
             {"role": "user", "content": full_user_prompt}
@@ -695,7 +706,7 @@ Guidelines:
         logger.debug(f"Full payload:\n{json.dumps(payload, indent=2)}")
 
         headers = {'Content-Type': 'application/json'}
-        # Enable streaming for response with a timeout to prevent hanging
+        # Enable streaming response with a timeout
         response = requests.post(OLLAMA_URL, data=json.dumps(payload), headers=headers, stream=True, timeout=60)
 
         logger.debug(f"Response status code: {response.status_code}")
@@ -724,12 +735,13 @@ Guidelines:
                     logger.debug(f"Line content: {line}")
                     continue
 
+        # Check if the response content is empty
         if not response_content.strip():
             logger.warning("Received empty response from LLM.")
             logger.debug(f"Complete raw response: {raw_response}")
             return ""
 
-        # Cache the result outside the lock to prevent holding the lock during I/O
+        # Cache the result if caching is enabled
         if cache:
             with cache_lock:
                 logger.debug("Caching the generated response.")
@@ -805,6 +817,7 @@ def auto_chat(selected_characters, session_id, character_prompts):
                 "timestamp": timestamp
             }
             history.append(assistant_message)
+            new_message_queue.put(assistant_message)
             logger.debug(f"Appended assistant message to history: {assistant_message}")
 
             # Store the updated session data with the character's response
@@ -813,6 +826,9 @@ def auto_chat(selected_characters, session_id, character_prompts):
 
             # Add new message to the queue for the front-end to process
             new_message_queue.put(assistant_message)
+
+            # Send real-time update to chatbot UI
+            gr.update(value=format_history_for_display(history))
 
             # Check if context exceeds maximum length and summarize if necessary
             context_length = len(json.dumps(history))
@@ -934,22 +950,28 @@ def main():
                 try:
                     existing_sessions = get_existing_sessions()
                     logger.debug(f"Existing sessions on load: {existing_sessions}")
+                    
                     if existing_sessions:
-                        selected_session_id = existing_sessions[0]
+                        selected_session_id = existing_sessions[0]  # Select the first session
                         history_value, summary_value = retrieve_session_data(selected_session_id)
                     else:
                         # If no existing sessions, create a new one
                         new_session = create_new_session(character_prompts)
-                        selected_session_id = new_session[0].value
+                        
+                        # Access dictionary values correctly (new_session[0] is a dictionary returned by gr.update)
+                        selected_session_id = new_session[0]['value']  # Corrected dictionary access
+                        
                         history_value = new_session[2]
                         summary_value = new_session[3]
-                        character_info = new_session[4].value
+                        character_info = new_session[4]['value']  # Corrected dictionary access
                         assistant_char = new_session[5]
+                        
                         existing_sessions = [selected_session_id]
                         logger.debug(f"Created new session on load: {selected_session_id}")
+                    
+                    # Add further logic to handle history and assistant_char
                     history_value = add_name_to_history(history_value)
                     formatted_history = format_history_for_display(history_value)
-                    # Update character info display
                     character_info = update_character_info()
 
                     # Determine assistant character from history
@@ -958,22 +980,22 @@ def main():
                         if msg['role'] == 'assistant':
                             assistant_char = msg.get('name', None)
                             break
-
+                    
                     if not assistant_char and character_prompts:
                         # If no assistant character found in history, default to the first character
                         assistant_char = next(iter(character_prompts))
-
+                    
                     logger.debug(f"Assistant character on load: {assistant_char}")
-
+                    
                     return (
                         gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
-                        gr.update(value=formatted_history),                             # chatbot
-                        history_value,                                                 # history state
-                        summary_value,                                                 # summary state
-                        gr.update(value=character_info),                             # character_info_display
-                        assistant_char,                                                # assistant_character state
-                        gr.update(visible=True),                                      # Show chat_container
-                        gr.update(visible=False),                                     # Hide slideshow_container
+                        gr.update(value=formatted_history),  # chatbot
+                        history_value,  # history state
+                        summary_value,  # summary state
+                        gr.update(value=character_info),  # character_info_display
+                        assistant_char,  # assistant_character state
+                        gr.update(visible=True),  # Show chat container
+                        gr.update(visible=False),  # Hide slideshow container
                         0  # Initialize slideshow_index
                     )
                 except Exception as e:
@@ -989,9 +1011,8 @@ def main():
                         "Assistant",
                         gr.update(visible=True),
                         gr.update(visible=False),
-                        0  # Initialize slideshow_index
+                        0  # Reset slideshow_index
                     )
-
             demo.load(
                 load_default_session,
                 inputs=None,
@@ -1120,13 +1141,59 @@ def main():
             )
 
             # Event: Start auto chat
-            def handle_start_auto_chat(selected_characters_value, session_id_value):
-                return start_auto_chat(selected_characters_value, session_id_value, character_prompts)
+            def handle_start_auto_chat(selected_characters_value, session_id_value, history):
+                """Generator function for auto chat, streaming new messages to the front-end."""
+
+                # Log the initial value of history
+                logger.debug(f"Initial history value: {history}")
+
+                # Check if history is None and initialize it if necessary
+                if history is None:
+                    logger.warning("History was None, initializing an empty list.")
+                    history_list = []  # Initialize history as an empty list
+                else:
+                    history_list = history  # Extract the value from the State object
+
+                # Start the auto chat logic (initial session setup)
+                result = start_auto_chat(selected_characters_value, session_id_value, character_prompts)
+
+                # Log the initial result
+                logger.debug(f"Initial result from start_auto_chat: {result}")
+
+                # Yield the initial result to set up the session in the front-end (including the full history)
+                yield result[0], result[1], result[2], result[3], result[4]
+
+                # Continue yielding new messages from the auto chat as they are generated
+                while auto_mode_active:
+                    try:
+                        new_message = new_message_queue.get(timeout=1)  # Get new message from the queue (blocking)
+
+                        logger.debug(f"New message retrieved: {new_message}")
+
+                        # Append the new message to the extracted history list
+                        history_list.append(new_message)
+
+                        # Log the updated history
+                        logger.debug(f"Updated history: {history_list}")
+
+                        # Format the updated full history for display
+                        formatted_history = format_history_for_display(history_list)  # Format the entire history
+
+                        # Log the formatted history
+                        logger.debug(f"Formatted history for display: {formatted_history}")
+                        
+                        # Yield the entire history to the Gradio front-end
+                        yield gr.update(value=formatted_history), gr.update(), gr.update(), gr.update(), gr.update()
+                    except queue.Empty:
+                        continue  # No new messages, keep waiting
+
+
 
             start_auto_button.click(
                 handle_start_auto_chat,
-                inputs=[selected_characters, session_id_dropdown],
-                outputs=[chatbot, history, summary, character_info_display, assistant_character]
+                inputs=[selected_characters, session_id_dropdown, history],  # Pass history as input
+                outputs=[chatbot, history, summary, character_info_display, assistant_character],
+                queue=True  # Enable Gradio's task queue for async streaming
             )
 
             # Event: Stop auto chat
@@ -1253,26 +1320,25 @@ _{message['timestamp']}_
                 outputs=[chat_container, slideshow_container]
             )
 
-            # Event: Streaming new messages to frontend
-            def stream_new_messages():
-                """Generator function to stream new messages to the frontend."""
-                while True:
-                    try:
-                        message = new_message_queue.get(timeout=1)
-                        formatted_message = format_history_for_display([message])
-                        yield formatted_message
-                    except queue.Empty:
-                        continue
+        # Function to stream new messages to the chatbot
+        def stream_new_messages():
+            """Generator function to stream new messages to the frontend."""
+            while True:
+                try:
+                    message = new_message_queue.get(timeout=1)
+                    formatted_message = format_history_for_display([message])
+                    yield formatted_message
+                except queue.Empty:
+                    continue
 
-            # Initialize the Chatbot with streaming
-            # Note: Gradio's streaming requires the generator to yield messages
-            def chatbot_stream():
-                for message in stream_new_messages():
-                    yield message
+        # Start streaming in a separate thread
+        def chatbot_stream():
+            for message in stream_new_messages():
+                yield message
 
-            # Start streaming in a separate thread
-            streaming_thread = threading.Thread(target=chatbot_stream, daemon=True)
-            streaming_thread.start()
+        # Start streaming thread for new messages
+        streaming_thread = threading.Thread(target=chatbot_stream, daemon=True)
+        streaming_thread.start()
 
         logger.info("Launching Gradio app.")
         # Launch Gradio with share=False for local access
