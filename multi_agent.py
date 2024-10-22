@@ -22,7 +22,7 @@ CHARACTER_DIR = 'characters'  # Directory where character text files are stored
 LOG_FILE = 'app.log'  # Log file path
 
 # Summarization settings (configurable)
-MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
+MAX_CONTEXT_LENGTH = 100000  # Max context length before summarizing
 DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 8  # Configurable number of recent messages to keep in history after summarizing
 SUMMARY_PROMPT_TEMPLATE = (
     "Please provide a concise but comprehensive summary of the following conversation, "
@@ -1004,3 +1004,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
         logger.debug(traceback.format_exc())
+        
