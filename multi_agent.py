@@ -29,6 +29,9 @@ SUMMARY_PROMPT_TEMPLATE = (
     "including all important details, timestamps, and topics discussed:\n{conversation}\nSummary:"
 )
 
+# Initialize a lock for session data to prevent race conditions
+session_lock = threading.Lock()
+
 # Initialize logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -407,9 +410,10 @@ def reset_chat(session_id, character_prompts):
 new_message_queue = queue.Queue()
 
 # Function to handle user input
-def respond(user_input, history, summary, session_id, assistant_character):
+def respond(user_input, history, summary, session_id, assistant_character, user_name):
     """Handle user input and append it to the chat history."""
     global character_prompts  # Access the global character_prompts variable
+    global auto_mode_active  # Access the global auto_mode_active variable
 
     logger.debug(f"User input received: {user_input}")
     # Check for empty user input
@@ -433,35 +437,52 @@ def respond(user_input, history, summary, session_id, assistant_character):
             assistant_character                                      # assistant_character state
         )
 
-    # Append user message to history with 'User' as the name and current timestamp
+    # Get current timestamp
     timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
-    user_message = {
-        "role": "user",
-        "content": user_input,
-        "name": "User",
-        "timestamp": timestamp
-    }
-    history.append(user_message)
-    logger.debug(f"Appended user message to history: {user_message}")
 
-    # Store the updated session data
-    store_session_data(session_id, history, summary)
-    logger.debug("Updated session data stored.")
+    with session_lock:
+        if auto_mode_active:
+            # In Auto Chat Mode: Directly add user message to history
+            user_message = {
+                "role": "user",
+                "content": user_input,
+                "name": user_name,
+                "timestamp": timestamp
+            }
+            history.append(user_message)
+            logger.debug(f"Appended user message to history in auto mode: {user_message}")
 
-    # Generate response from LLM
-    character_name = "Assistant"  # Default name if not found
-    character_prompt = ""
+            # Store the updated session data
+            store_session_data(session_id, history, summary)
+            logger.debug("Updated session data stored in auto mode.")
 
-    if assistant_character:
-        character_name = assistant_character
-        character_prompt = character_prompts.get(character_name, "")
-    elif character_prompts:
-        # If no assistant character is selected, default to the first character
-        character_name = next(iter(character_prompts))
-        character_prompt = character_prompts[character_name]
-    else:
-        logger.warning("No character prompts available. Using default 'Assistant'.")
-        character_prompt = ""
+            # Return updated components
+            return (
+                gr.update(value=format_history_for_display(history)),  # chatbot
+                history,                                             # history
+                summary,                                             # summary
+                "",                                                  # user_input
+                assistant_character                                  # assistant_character state
+            )
+        else:
+            # Normal Mode: Existing behavior of sending message to LLM
+            # Append user message to history with custom name and current timestamp
+            user_message = {
+                "role": "user",
+                "content": user_input,
+                "name": user_name,
+                "timestamp": timestamp
+            }
+            history.append(user_message)
+            logger.debug(f"Appended user message to history: {user_message}")
+
+            # Store the updated session data
+            store_session_data(session_id, history, summary)
+            logger.debug("Updated session data stored.")
+
+    # Generate response from LLM outside the lock to prevent blocking
+    character_name = assistant_character if assistant_character else "Assistant"
+    character_prompt = character_prompts.get(character_name, "") if character_prompts else ""
 
     logger.debug(f"Assistant Character: {character_name}, Prompt Length: {len(character_prompt)}")
 
@@ -479,22 +500,20 @@ def respond(user_input, history, summary, session_id, assistant_character):
     # Get current timestamp
     timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
 
-    # Append character message to history
-    assistant_message = {
-        "role": "assistant",
-        "content": response,
-        "name": character_name,
-        "timestamp": timestamp
-    }
-    history.append(assistant_message)
-    logger.debug(f"Appended assistant message to history: {assistant_message}")
+    # Append character message to history within the lock
+    with session_lock:
+        assistant_message = {
+            "role": "assistant",
+            "content": response,
+            "name": character_name,
+            "timestamp": timestamp
+        }
+        history.append(assistant_message)
+        logger.debug(f"Appended assistant message to history: {assistant_message}")
 
-    # Update the slideshow index to the latest message
-    slideshow_index = len(history) - 1
-
-    # Store the updated session data with the character's response
-    store_session_data(session_id, history, summary)
-    logger.debug("Character response stored in session data.")
+        # Store the updated session data with the character's response
+        store_session_data(session_id, history, summary)
+        logger.debug("Character response stored in session data.")
 
     # Return updated components
     return (
@@ -676,9 +695,10 @@ As {character_name}, respond to the latest message in a single line using the co
 
 Guidelines:  
 1. Stay in character as {character_name}.  
-2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
+2. Use Markdown for formatting but do not mention markdown. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
 3. On your turn, you can choose to either just describe your feelings and actions or also speak.  
 4. Keep responses concise yet engaging.
+5. Do not start with Name: because the message will already include your name.
 """
         else:
             # If there's no history, send a generic start-conversation prompt
@@ -688,8 +708,9 @@ As {character_name}, start a conversation with the user.
 
 Guidelines:  
 1. Stay in character as {character_name}.  
-2. Use Markdown for formatting. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
+2. Use Markdown for formatting but do not mention markdown. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
 3. Keep responses concise yet engaging.
+4. Do not start with Name: because the message will already include your name.
 """
 
         # Prepare the system and user messages for the LLM
@@ -770,9 +791,6 @@ def auto_chat(selected_characters, session_id, character_prompts):
     global auto_mode_active
     current_index = 0
     try:
-        # Retrieve history and summary at the start
-        history, summary = retrieve_session_data(session_id)
-        history = add_name_to_history(history)
         logger.debug(f"Auto chat started with session_id: {session_id}")
 
         while auto_mode_active:
@@ -784,16 +802,21 @@ def auto_chat(selected_characters, session_id, character_prompts):
             current_character_prompt = character_prompts.get(current_character_name, "")
             logger.debug(f"Current character for auto chat: {current_character_name}")
 
-            # Prepare user_prompt from the last message or default
-            if history and history[-1]['role'] == 'assistant':
-                user_prompt = history[-1]['content']
-            elif history and history[-1]['role'] == 'user':
-                user_prompt = history[-1]['content']
-            else:
-                # No history, instruct LLM to start the conversation
-                user_prompt = ""
+            # Acquire the lock to safely access and modify the history
+            with session_lock:
+                history, summary = retrieve_session_data(session_id)
+                history = add_name_to_history(history)
 
-            # Generate response
+                # Prepare user_prompt from the last message or default
+                if history and history[-1]['role'] == 'assistant':
+                    user_prompt = history[-1]['content']
+                elif history and history[-1]['role'] == 'user':
+                    user_prompt = history[-1]['content']
+                else:
+                    # No history, instruct LLM to start the conversation
+                    user_prompt = ""
+
+            # Generate response from LLM
             response = generate_response_with_llm(user_prompt, history, summary, current_character_prompt, MODEL_NAME)
 
             logger.debug(f"Generated response from LLM for {current_character_name}: {response}")
@@ -809,32 +832,35 @@ def auto_chat(selected_characters, session_id, character_prompts):
             # Get current timestamp
             timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
 
-            # Append messages with speaker's name and timestamp
+            # Prepare assistant message
             assistant_message = {
                 "role": "assistant",
                 "content": response,
                 "name": current_character_name,
                 "timestamp": timestamp
             }
-            history.append(assistant_message)
-            new_message_queue.put(assistant_message)
-            logger.debug(f"Appended assistant message to history: {assistant_message}")
 
-            # Store the updated session data with the character's response
-            store_session_data(session_id, history, summary)
-            logger.debug("Character response stored in session data.")
+            # Acquire the lock to safely append and store the assistant message
+            with session_lock:
+                history.append(assistant_message)
+                new_message_queue.put(assistant_message)
+                logger.debug(f"Appended assistant message to history: {assistant_message}")
 
-            # Check if context exceeds maximum length and summarize if necessary
-            context_length = len(json.dumps(history))
-            if context_length > MAX_CONTEXT_LENGTH:
-                summary = summarize_history(history, summary, current_character_prompt, MODEL_NAME, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP)
-                # Keep only the recent messages
-                history = history[-DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP:]
-                logger.info("Context length exceeded maximum. Summarized the conversation.")
+                # Store the updated session data with the character's response
+                store_session_data(session_id, history, summary)
+                logger.debug("Character response stored in session data.")
 
-            # Store the updated session data with new summary and history
-            store_session_data(session_id, history, summary)
-            logger.debug("Updated session data stored after auto chat.")
+                # Check if context exceeds maximum length and summarize if necessary
+                context_length = len(json.dumps(history))
+                if context_length > MAX_CONTEXT_LENGTH:
+                    summary = summarize_history(history, summary, current_character_prompt, MODEL_NAME, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP)
+                    # Keep only the recent messages
+                    history = history[-DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP:]
+                    logger.info("Context length exceeded maximum. Summarized the conversation.")
+
+                    # Store the updated session data with new summary and history
+                    store_session_data(session_id, history, summary)
+                    logger.debug("Updated session data stored after auto chat.")
 
             # Move to next character
             current_index = (current_index + 1) % len(selected_characters)
@@ -864,6 +890,32 @@ script_js = """
             document.getElementById('next_button').click();
         }
     });
+
+    // Auto-scroll to the latest message in the chatbot
+    function scrollToBottom() {
+        const chatbotElement = document.getElementById('chatbot');
+        if (chatbotElement) {
+            // Find the scrollable container within the chatbot
+            const scrollableDiv = chatbotElement.querySelector('.overflow-auto');
+            if (scrollableDiv) {
+                scrollableDiv.scrollTop = scrollableDiv.scrollHeight;
+            }
+        }
+    }
+
+    // Observe changes in the chatbot and trigger scroll
+    const chatbotObserver = new MutationObserver(function(mutations) {
+        scrollToBottom();
+    });
+
+    // Start observing the chatbot container for changes
+    const chatbotElement = document.getElementById('chatbot');
+    if (chatbotElement) {
+        const scrollableDiv = chatbotElement.querySelector('.overflow-auto');
+        if (scrollableDiv) {
+            chatbotObserver.observe(scrollableDiv, { childList: true, subtree: true });
+        }
+    }
     </script>
     """
 
@@ -910,6 +962,7 @@ def main():
             history = gr.State([])
             summary = gr.State("")
             assistant_character = gr.State(None)  # State for assistant character
+            user_name = gr.State("User")  # State for user name
 
             # Wrap chat interface in a container for visibility management
             with gr.Row() as chat_container:
@@ -943,9 +996,28 @@ def main():
                             interactive=True
                         )
 
+                    # User name input
+                    with gr.Row():
+                        user_name_input = gr.Textbox(
+                            label="Your Name",
+                            value="User",
+                            placeholder="Enter your name",
+                            interactive=True
+                        )
+                        # Update user_name state when user_name_input changes
+                        user_name_input.change(
+                            lambda x: x.strip() if x.strip() else "User",
+                            inputs=user_name_input,
+                            outputs=user_name
+                        )
+
                     # Initialize Chatbot with 'messages' type
-                    chatbot = gr.Chatbot(type='messages')
-                    user_input = gr.Textbox(label="Your Message", placeholder="Type your message here and press Enter")
+                    chatbot = gr.Chatbot(type='messages', elem_id='chatbot')
+                    user_input = gr.Textbox(
+                        label="Your Message",
+                        placeholder="Type your message here and press Enter",
+                        lines=1
+                    )
 
                     # Reset chat button
                     reset_button = gr.Button("Reset Chat")
@@ -994,7 +1066,6 @@ def main():
                             break
                     
                     if not assistant_char and character_prompts:
-                        # If no assistant character found in history, default to the first character
                         assistant_char = next(iter(character_prompts))
                     
                     logger.debug(f"Assistant character on load: {assistant_char}")
@@ -1006,8 +1077,9 @@ def main():
                         summary_value,  # summary state
                         gr.update(value=character_info),  # character_info_display
                         assistant_char,  # assistant_character state
-                        gr.update(visible=True),  # Show chat container
-                        gr.update(visible=False),  # Hide slideshow container
+                        user_name,        # user_name state
+                        gr.update(visible=True),  # Show chat_container
+                        gr.update(visible=False),  # Hide slideshow_container
                         len(history_value) - 1 if history_value else 0  # Initialize slideshow_index to last message
                     )
                 except Exception as e:
@@ -1021,6 +1093,7 @@ def main():
                         "",
                         gr.update(value="**Current Date & Time:** N/A"),
                         "Assistant",
+                        gr.update(value="User"),
                         gr.update(visible=True),
                         gr.update(visible=False),
                         0  # Reset slideshow_index
@@ -1036,6 +1109,7 @@ def main():
                     summary,
                     character_info_display,
                     assistant_character,
+                    user_name,
                     chat_container,
                     slideshow_container,
                     slideshow_index
@@ -1058,23 +1132,23 @@ def main():
                             gr.update(visible=False),  # Hide slideshow_container
                             0  # Reset slideshow_index
                         )
-                    history_value, summary_value = retrieve_session_data(session_id_value)
-                    history_value = add_name_to_history(history_value)
-                    formatted_history = format_history_for_display(history_value)
-                    character_info = update_character_info()
+                    with session_lock:
+                        history_value, summary_value = retrieve_session_data(session_id_value)
+                        history_value = add_name_to_history(history_value)
+                        formatted_history = format_history_for_display(history_value)
+                        character_info = update_character_info()
 
-                    # Attempt to determine the assistant character from history
-                    assistant_char = None
-                    for msg in reversed(history_value):
-                        if msg['role'] == 'assistant':
-                            assistant_char = msg.get('name', None)
-                            break
+                        # Attempt to determine the assistant character from history
+                        assistant_char = None
+                        for msg in reversed(history_value):
+                            if msg['role'] == 'assistant':
+                                assistant_char = msg.get('name', None)
+                                break
 
-                    if not assistant_char and character_prompts:
-                        # If no assistant character found in history, default to the first character
-                        assistant_char = next(iter(character_prompts))
+                        if not assistant_char and character_prompts:
+                            assistant_char = next(iter(character_prompts))
 
-                    logger.debug(f"Assistant character determined: {assistant_char}")
+                        logger.debug(f"Assistant character determined: {assistant_char}")
 
                     return (
                         gr.update(value=formatted_history),
@@ -1119,7 +1193,7 @@ def main():
             # Event: Handle user input submission
             user_input.submit(
                 respond,
-                inputs=[user_input, history, summary, session_id_dropdown, assistant_character],
+                inputs=[user_input, history, summary, session_id_dropdown, assistant_character, user_name],
                 outputs=[chatbot, history, summary, user_input, assistant_character]
             )
 
@@ -1157,54 +1231,71 @@ def main():
             def handle_start_auto_chat(selected_characters_value, session_id_value, history_value):
                 """Generator function for auto chat, streaming new messages to the front-end."""
 
-                # Log the initial value of history
-                logger.debug(f"Initial history value: {history_value}")
+                logger.debug(f"Starting auto-chat for session_id: {session_id_value} with selected_characters: {selected_characters_value}")
 
-                # Check if history is None and initialize it if necessary
-                if history_value is None:
-                    logger.warning("History was None, initializing an empty list.")
-                    history_list = []  # Initialize history as an empty list
-                else:
-                    history_list = history_value.copy()  # Extract the value from the State object
+                # Start the auto chat thread
+                start_auto_chat(selected_characters_value, session_id_value, character_prompts)
 
-                # Start the auto chat logic (initial session setup)
-                result = start_auto_chat(selected_characters_value, session_id_value, character_prompts)
+                # Initial fetch of history and summary
+                with session_lock:
+                    history_fetched, summary_fetched = retrieve_session_data(session_id_value)
+                    history_fetched = add_name_to_history(history_fetched)
+                    formatted_history = format_history_for_display(history_fetched)
+                    character_info = update_character_info()
 
-                # Log the initial result
-                logger.debug(f"Initial result from start_auto_chat: {result}")
+                    # Determine assistant character from history
+                    assistant_char = None
+                    for msg in reversed(history_fetched):
+                        if msg['role'] == 'assistant':
+                            assistant_char = msg.get('name', None)
+                            break
 
-                # Yield the initial result to set up the session in the front-end (including the full history)
-                yield result[0], result[1], result[2], result[3], result[4]
+                    if not assistant_char and character_prompts:
+                        assistant_char = next(iter(character_prompts))
 
-                # Continue yielding new messages from the auto chat as they are generated
+                # Initial yield to set up the session in the front-end
+                yield (
+                    gr.update(value=formatted_history),  # chatbot
+                    history_fetched,                     # history state
+                    summary_fetched,                     # summary state
+                    gr.update(value=character_info),     # character_info_display
+                    assistant_char                      # assistant_character state
+                )
+
+                # Continuously yield updates as new messages arrive
                 while auto_mode_active:
                     try:
-                        new_message = new_message_queue.get(timeout=1)  # Get new message from the queue (blocking)
+                        new_message = new_message_queue.get(timeout=1)  # Blocking wait for new message
 
-                        logger.debug(f"New message retrieved: {new_message}")
+                        logger.debug(f"New auto-chat message received: {new_message}")
 
-                        # Append the new message to the extracted history list
-                        history_list.append(new_message)
+                        with session_lock:
+                            # Fetch the latest history from the database
+                            history_fetched, summary_fetched = retrieve_session_data(session_id_value)
+                            history_fetched = add_name_to_history(history_fetched)
+                            formatted_history = format_history_for_display(history_fetched)
+                            character_info = update_character_info()
 
-                        # Log the updated history
-                        logger.debug(f"Updated history: {history_list}")
+                            # Determine assistant character from updated history
+                            assistant_char = None
+                            for msg in reversed(history_fetched):
+                                if msg['role'] == 'assistant':
+                                    assistant_char = msg.get('name', None)
+                                    break
 
-                        # Format the updated full history for display
-                        formatted_history = format_history_for_display(history_list)  # Format the entire history
+                            if not assistant_char and character_prompts:
+                                assistant_char = next(iter(character_prompts))
 
-                        # Log the formatted history
-                        logger.debug(f"Formatted history for display: {formatted_history}")
-                        
-                        # Yield the entire history to the Gradio front-end
+                        # Yield the updated history to the front-end
                         yield (
-                            gr.update(value=format_history_for_display(history_list)),  # chatbot
-                            history_list,                                            # history state
-                            summary,                                                 # summary
-                            gr.update(),                                             # character_info_display
-                            assistant_character                                      # assistant_character state
+                            gr.update(value=formatted_history),  # chatbot
+                            history_fetched,                     # history state
+                            summary_fetched,                     # summary state
+                            gr.update(value=character_info),     # character_info_display
+                            assistant_char                      # assistant_character state
                         )
                     except queue.Empty:
-                        continue  # No new messages, keep waiting
+                        continue  # No new messages, continue waiting
 
             start_auto_button.click(
                 handle_start_auto_chat,
@@ -1246,23 +1337,24 @@ def main():
                             gr.update(visible=False),
                             0
                         )
-                    history_value, _ = retrieve_session_data(session_id_value)
-                    if not history_value:
-                        logger.warning("No history available for slideshow.")
-                        return (
-                            gr.update(visible=True),
-                            gr.update(visible=False),
-                            0
-                        )
-                    # Initialize slideshow_index to the last message
-                    initial_index = len(history_value) - 1 if history_value else 0
-                    # Update slideshow_text with the current message
-                    message = history_value[initial_index]
-                    display_text = f"""**{message['name']}**  
+                    with session_lock:
+                        history_value, _ = retrieve_session_data(session_id_value)
+                        if not history_value:
+                            logger.warning("No history available for slideshow.")
+                            return (
+                                gr.update(visible=True),
+                                gr.update(visible=False),
+                                0
+                            )
+                        # Initialize slideshow_index to the last message
+                        initial_index = len(history_value) - 1 if history_value else 0
+                        # Update slideshow_text with the current message
+                        message = history_value[initial_index]
+                        display_text = f"""**{message['name']}**  
 _{message['timestamp']}_
 
 {message['content']}"""
-                    slideshow_text.value = display_text
+                        slideshow_text.value = display_text
                     return (
                         gr.update(visible=False),  # Hide chat_container
                         gr.update(visible=True),   # Show slideshow_container
