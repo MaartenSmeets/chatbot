@@ -294,6 +294,7 @@ def create_new_session(character_prompts):
     assistant_char = "Assistant"
     logger.debug(f"Assistant character initialized to: {assistant_char}")
     return (
+        new_session_id,  # Return the new session ID
         gr.update(choices=existing_sessions, value=new_session_id),  # session_id_dropdown
         gr.update(value=format_history_for_display(history)),       # chatbot
         history,                                                   # history state
@@ -498,15 +499,23 @@ def respond(user_input, history, summary, session_id, assistant_character):
         "timestamp": timestamp
     }
     history.append(assistant_message)
-    yield gr.update(value=format_history_for_display(history))
     logger.debug(f"Appended assistant message to history: {assistant_message}")
+
+    # Update the slideshow index to the latest message
+    slideshow_index = len(history) - 1
 
     # Store the updated session data with the character's response
     store_session_data(session_id, history, summary)
     logger.debug("Character response stored in session data.")
 
-    # Return a stream of new messages
-    return stream_new_messages(history)
+    # Return updated components
+    return (
+        gr.update(value=format_history_for_display(history)),  # chatbot
+        history,                                             # history
+        summary,                                             # summary
+        "",                                                  # user_input
+        assistant_character                                  # assistant_character state
+    )
 
 # Function to start auto chat
 def start_auto_chat(selected_characters, session_id, character_prompts):
@@ -824,11 +833,11 @@ def auto_chat(selected_characters, session_id, character_prompts):
             store_session_data(session_id, history, summary)
             logger.debug("Character response stored in session data.")
 
-            # Add new message to the queue for the front-end to process
-            new_message_queue.put(assistant_message)
+            # Remove the redundant line below
+            # new_message_queue.put(assistant_message)  # <-- Removed
 
-            # Send real-time update to chatbot UI
-            gr.update(value=format_history_for_display(history))
+            # Remove the gr.update() call as it doesn't affect the UI from a background thread
+            # gr.update(value=format_history_for_display(history))  # <-- Removed
 
             # Check if context exceeds maximum length and summarize if necessary
             context_length = len(json.dumps(history))
@@ -958,13 +967,15 @@ def main():
                         # If no existing sessions, create a new one
                         new_session = create_new_session(character_prompts)
                         
-                        # Access dictionary values correctly (new_session[0] is a dictionary returned by gr.update)
-                        selected_session_id = new_session[0]['value']  # Corrected dictionary access
+                        # Extract the new session ID
+                        selected_session_id = new_session[0]  # new_session_id is the first element
                         
-                        history_value = new_session[2]
-                        summary_value = new_session[3]
-                        character_info = new_session[4]['value']  # Corrected dictionary access
-                        assistant_char = new_session[5]
+                        # Extract other components
+                        chatbot_update = new_session[1]
+                        history_value = new_session[3]
+                        summary_value = new_session[4]
+                        character_info = new_session[5]
+                        assistant_char = new_session[6]
                         
                         existing_sessions = [selected_session_id]
                         logger.debug(f"Created new session on load: {selected_session_id}")
@@ -1013,6 +1024,7 @@ def main():
                         gr.update(visible=False),
                         0  # Reset slideshow_index
                     )
+                
             demo.load(
                 load_default_session,
                 inputs=None,
@@ -1152,7 +1164,7 @@ def main():
                     logger.warning("History was None, initializing an empty list.")
                     history_list = []  # Initialize history as an empty list
                 else:
-                    history_list = history  # Extract the value from the State object
+                    history_list = history.copy()  # Extract the value from the State object
 
                 # Start the auto chat logic (initial session setup)
                 result = start_auto_chat(selected_characters_value, session_id_value, character_prompts)
@@ -1183,11 +1195,15 @@ def main():
                         logger.debug(f"Formatted history for display: {formatted_history}")
                         
                         # Yield the entire history to the Gradio front-end
-                        yield gr.update(value=formatted_history), gr.update(), gr.update(), gr.update(), gr.update()
+                        yield (
+                            gr.update(value=format_history_for_display(history_list)),  # chatbot
+                            history_list,                                            # history state
+                            gr.update(),                                             # summary
+                            gr.update(),                                             # character_info_display
+                            gr.update()                                              # assistant_character
+                        )
                     except queue.Empty:
                         continue  # No new messages, keep waiting
-
-
 
             start_auto_button.click(
                 handle_start_auto_chat,
@@ -1237,10 +1253,11 @@ def main():
                             gr.update(visible=False),
                             0
                         )
+                    # Initialize slideshow_index to the first message
                     return (
                         gr.update(visible=False),  # Hide chat_container
                         gr.update(visible=True),   # Show slideshow_container
-                        0                               # Reset slideshow index
+                        0                           # Initialize slideshow index
                     )
                 except Exception as e:
                     logger.error(f"Error entering slideshow: {e}")
@@ -1254,15 +1271,13 @@ def main():
                     if not history:
                         logger.warning("No messages to display in slideshow.")
                         return "No messages to display.", index
-                    if index < 0:
-                        index = 0
-                    elif index >= len(history):
-                        index = len(history) - 1
+                    # Adjust index if out of bounds
+                    index = max(0, min(index, len(history) - 1))
                     message = history[index]
                     display_text = f"""**{message['name']}**  
-_{message['timestamp']}_
+            _{message['timestamp']}_
 
-{message['content']}"""
+            {message['content']}"""
                     logger.debug(f"Displaying message: {display_text}")
                     return display_text, index
                 except Exception as e:
@@ -1283,7 +1298,7 @@ _{message['timestamp']}_
                 if index < len(history) - 1:
                     index += 1
                 return update_slideshow(index, history)
-
+            
             def exit_slideshow():
                 """Exit slideshow mode and return to chat interface."""
                 logger.debug("Exiting slideshow mode.")
@@ -1319,26 +1334,6 @@ _{message['timestamp']}_
                 inputs=None,
                 outputs=[chat_container, slideshow_container]
             )
-
-        # Function to stream new messages to the chatbot
-        def stream_new_messages():
-            """Generator function to stream new messages to the frontend."""
-            while True:
-                try:
-                    message = new_message_queue.get(timeout=1)
-                    formatted_message = format_history_for_display([message])
-                    yield formatted_message
-                except queue.Empty:
-                    continue
-
-        # Start streaming in a separate thread
-        def chatbot_stream():
-            for message in stream_new_messages():
-                yield message
-
-        # Start streaming thread for new messages
-        streaming_thread = threading.Thread(target=chatbot_stream, daemon=True)
-        streaming_thread.start()
 
         logger.info("Launching Gradio app.")
         # Launch Gradio with share=False for local access
