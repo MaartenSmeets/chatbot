@@ -300,14 +300,17 @@ def create_new_session(character_prompts):
     # Determine assistant character
     assistant_char = "Assistant"
     logger.debug(f"Assistant character initialized to: {assistant_char}")
-    # Return exactly 6 outputs corresponding to Gradio components
+    # Get current user_name value or set default
+    user_name_value = "User"  # Default value
+
     return (
         gr.update(choices=existing_sessions, value=new_session_id),  # session_id_dropdown
         gr.update(value=format_history_for_display(history)),       # chatbot
         history,                                                   # history state
         summary,                                                   # summary state
         gr.update(value=character_info),                           # character_info_display
-        assistant_char                                             # assistant_character state
+        assistant_char,                                             # assistant_character state
+        gr.update(value=user_name_value)                           # user_name state
     )
 
 # Function to retrieve existing sessions
@@ -446,13 +449,21 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
     # Get current timestamp
     timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
 
+    # Ensure user_name is a string
+    if isinstance(user_name, str):
+        name = user_name
+    elif hasattr(user_name, 'value') and isinstance(user_name.value, str):
+        name = user_name.value
+    else:
+        name = "User"  # Fallback name
+
     with session_lock:
         if auto_mode_active:
             # In Auto Chat Mode: Enqueue user message to the queue
             user_message = {
                 "role": "user",
                 "content": user_input,
-                "name": user_name,
+                "name": name,
                 "timestamp": timestamp
             }
             history.append(user_message)
@@ -481,7 +492,7 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
             user_message = {
                 "role": "user",
                 "content": user_input,
-                "name": user_name,
+                "name": name,
                 "timestamp": timestamp
             }
             history.append(user_message)
@@ -558,13 +569,18 @@ def start_auto_chat(selected_characters, session_id):
     if not selected_characters:
         logger.warning("No characters selected for auto chat.")
         return (
-            gr.update(), gr.update(), gr.update(), gr.update(), "Assistant"
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            "Assistant",
+            gr.update(value="User")  # Reset user_name to default if needed
         )
 
     if not session_id:
         logger.info("No session selected for auto chat. Creating a new session.")
         # Create a new session
-        create_new_session(character_prompts)
+        new_session_outputs = create_new_session(character_prompts)
         existing_sessions = get_existing_sessions()
         session_id = existing_sessions[-1] if existing_sessions else None
         history, summary = retrieve_session_data(session_id)
@@ -594,7 +610,8 @@ def start_auto_chat(selected_characters, session_id):
             history,
             summary,
             gr.update(value=character_info),
-            assistant_char
+            assistant_char,
+            gr.update(value="User")  # Ensure user_name remains a string
         )
 
     auto_mode_active = True
@@ -611,7 +628,8 @@ def start_auto_chat(selected_characters, session_id):
         history,
         summary,
         gr.update(value=character_info),
-        assistant_char
+        assistant_char,
+        gr.update(value="User")  # Ensure user_name remains a string
     )
 
 # Function to stop auto chat
@@ -715,7 +733,7 @@ Conversation history:
 
 {conversation_history}  
 ===  
-As {character_name}, respond to the latest message in a single line using the conversation history for context and guidance.  
+As {character_name}, respond to the latest message in a single line using the conversation history for context and guidance. If a recent earlier message is more relevant and still relevant to directly respond to, you can respond to that instead. 
 
 Guidelines:  
 1. Stay in character as {character_name}.  
@@ -827,7 +845,7 @@ def auto_chat(selected_characters, session_id):
             current_character_prompt = character_prompts.get(current_character_name, "")
             logger.debug(f"Current character for auto chat: {current_character_name}")
 
-            # Acquire the lock to safely access and modify the history
+            # Acquire the lock to safely access the history
             with session_lock:
                 history_fetched, summary_fetched = retrieve_session_data(session_id)
                 history_fetched = add_name_to_history(history_fetched)
@@ -845,7 +863,6 @@ def auto_chat(selected_characters, session_id):
             # Generate response from LLM
             response = generate_response_with_llm(user_prompt, history_fetched, summary_fetched, current_character_prompt, MODEL_NAME)
 
-            logger.debug(f"Generated response from LLM for {current_character_name}: {response}")
             if not response:
                 response = "I'm sorry, I couldn't process your request."
                 logger.warning(f"Empty response from LLM for {current_character_name}. Using default message.")
@@ -866,32 +883,9 @@ def auto_chat(selected_characters, session_id):
                 "timestamp": timestamp
             }
 
-            # Acquire the lock to safely append and store the assistant message
-            with session_lock:
-                history_fetched.append(assistant_message)
-                new_message_queue.put(assistant_message)  # Enqueue the message
-                logger.debug(f"Appended assistant message to history: {assistant_message}")
-
-                # Store the updated session data with the character's response
-                store_session_data(session_id, history_fetched, summary_fetched)
-                logger.debug("Character response stored in session data.")
-
-                # Fetch the latest history from the database
-                history_fetched, summary_fetched = retrieve_session_data(session_id)
-                history_fetched = add_name_to_history(history_fetched)
-                logger.debug(f"Updated history after appending assistant message: {history_fetched}")
-
-                # Check if context exceeds maximum length and summarize if necessary
-                context_length = len(json.dumps(history_fetched))
-                if context_length > MAX_CONTEXT_LENGTH:
-                    summary_fetched = summarize_history(history_fetched, summary_fetched, current_character_prompt, MODEL_NAME, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP)
-                    # Keep only the recent messages
-                    history_fetched = history_fetched[-DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP:]
-                    logger.info("Context length exceeded maximum. Summarized the conversation.")
-
-                    # Store the updated session data with new summary and history
-                    store_session_data(session_id, history_fetched, summary_fetched)
-                    logger.debug("Updated session data stored after auto chat.")
+            # Enqueue the assistant message to the new_message_queue
+            new_message_queue.put(assistant_message)
+            logger.debug(f"Enqueued assistant message to new_message_queue: {assistant_message}")
 
             # Move to next character
             current_index = (current_index + 1) % len(selected_characters)
@@ -950,7 +944,6 @@ script_js = """
     </script>
     """
 
-# Function to set up the Gradio interface
 # Function to set up the Gradio interface
 def main():
     global cache, character_prompts, auto_mode_active, selected_characters_global, session_id_global, auto_chat_thread
@@ -1079,7 +1072,7 @@ def main():
                         history_value, summary_value = retrieve_session_data(selected_session_id)
                     else:
                         # If no existing sessions, create a new one
-                        create_new_session(character_prompts)
+                        new_session_outputs = create_new_session(character_prompts)
                         existing_sessions = get_existing_sessions()
                         selected_session_id = existing_sessions[-1] if existing_sessions else None
                         history_value, summary_value = retrieve_session_data(selected_session_id)
@@ -1102,16 +1095,25 @@ def main():
 
                     logger.debug(f"Assistant character on load: {assistant_char}")
 
+                    # Get current user_name value or set default
+                    user_name_value = "User"  # Default value
+                    # Ensure 'user_name' is a Gradio State object and extract its value
+                    if isinstance(user_name, gr.State):
+                        if user_name.value and isinstance(user_name.value, str):
+                            user_name_value = user_name.value
+                    elif isinstance(user_name, str):
+                        user_name_value = user_name
+
                     return (
                         gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
                         gr.update(value=formatted_history),  # chatbot
-                        history_value,  # history state
-                        summary_value,  # summary state
-                        gr.update(value=character_info),  # character_info_display
-                        assistant_char,  # assistant_character state
-                        user_name,        # user_name state
-                        gr.update(visible=True),  # Show chat_container
-                        gr.update(visible=False),  # Hide slideshow_container
+                        history_value,                        # history state
+                        summary_value,                        # summary state
+                        gr.update(value=character_info),      # character_info_display
+                        assistant_char,                       # assistant_character state
+                        gr.update(value=user_name_value),     # user_name state
+                        gr.update(visible=True),              # Show chat_container
+                        gr.update(visible=False),             # Hide slideshow_container
                         len(history_value) - 1 if history_value else 0  # Initialize slideshow_index to last message
                     )
                 except Exception as e:
@@ -1182,6 +1184,14 @@ def main():
 
                         logger.debug(f"Assistant character determined: {assistant_char}")
 
+                    # Get current user_name value or set default
+                    user_name_value = "User"  # Default value
+                    if isinstance(user_name, gr.State):
+                        if user_name.value and isinstance(user_name.value, str):
+                            user_name_value = user_name.value
+                    elif isinstance(user_name, str):
+                        user_name_value = user_name
+
                     return (
                         gr.update(value=formatted_history),
                         history_value,
@@ -1231,22 +1241,94 @@ def main():
 
             # Event: Create new session
             def handle_create_new_session():
-                return create_new_session(character_prompts)
+                """Handle the creation of a new session."""
+                logger.debug("Handling creation of a new session.")
+                try:
+                    return create_new_session(character_prompts)
+                except Exception as e:
+                    logger.error(f"Error in handle_create_new_session: {e}")
+                    logger.debug(traceback.format_exc())
+                    # Return default safe values to prevent Gradio from crashing
+                    return (
+                        gr.update(choices=[], value=None),
+                        gr.update(value=[]),
+                        [],
+                        "",
+                        gr.update(value="**Current Date & Time:** N/A"),
+                        "Assistant",
+                        gr.update(value="User")
+                    )
 
             new_session_button.click(
                 handle_create_new_session,
                 inputs=None,
-                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character]
+                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character, user_name]
             )
 
             # Event: Delete session
             def handle_delete_session(session_id_value):
-                return delete_session(session_id_value, character_prompts)
+                logger.debug(f"Deleting session ID: {session_id_value}")
+                if session_id_value:
+                    delete_session_data(session_id_value)
+                    logger.info(f"Deleted session data for session_id: {session_id_value}")
+                # Update session dropdown choices
+                existing_sessions = get_existing_sessions()
+                logger.debug(f"Updated session list after deletion: {existing_sessions}")
+
+                if not existing_sessions:
+                    # If no sessions left, create a new one
+                    new_session_outputs = create_new_session(character_prompts)
+                    return (
+                        new_session_outputs[0],  # session_id_dropdown
+                        new_session_outputs[1],  # chatbot
+                        new_session_outputs[2],  # history
+                        new_session_outputs[3],  # summary
+                        new_session_outputs[4],  # character_info_display
+                        new_session_outputs[5],  # assistant_character
+                        new_session_outputs[6]   # user_name
+                    )
+                else:
+                    # If sessions exist, select the first one
+                    selected_session_id = existing_sessions[0]
+                    history, summary = retrieve_session_data(selected_session_id)
+                    history = add_name_to_history(history)
+                    formatted_history = format_history_for_display(history)
+                    character_info = update_character_info()
+
+                    # Determine assistant character from history
+                    assistant_char = None
+                    for msg in reversed(history):
+                        if msg['role'] == 'assistant':
+                            assistant_char = msg.get('name', None)
+                            break
+
+                    if not assistant_char and character_prompts:
+                        assistant_char = next(iter(character_prompts))
+
+                    logger.debug(f"Assistant character determined after deletion: {assistant_char}")
+
+                    # Get current user_name value or set default
+                    user_name_value = "User"  # Default value
+                    if isinstance(user_name, gr.State):
+                        if user_name.value and isinstance(user_name.value, str):
+                            user_name_value = user_name.value
+                    elif isinstance(user_name, str):
+                        user_name_value = user_name
+
+                    return (
+                        gr.update(choices=existing_sessions, value=selected_session_id),  # session_id_dropdown
+                        gr.update(value=formatted_history),  # chatbot
+                        history,                             # history state
+                        summary,                             # summary state
+                        gr.update(value=character_info),     # character_info_display
+                        assistant_char,                      # assistant_character state
+                        gr.update(value=user_name_value)     # user_name state
+                    )
 
             delete_session_button.click(
                 handle_delete_session,
                 inputs=session_id_dropdown,
-                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character]
+                outputs=[session_id_dropdown, chatbot, history, summary, character_info_display, assistant_character, user_name]
             )
 
             # Event: Reset chat
@@ -1259,8 +1341,6 @@ def main():
                 outputs=[chatbot, history, summary, user_input, character_info_display, assistant_character]
             )
 
-            # Event: Start auto chat
-            # Function to handle automatic chat in background
             def handle_start_auto_chat(selected_characters_value, session_id_value):
                 """Generator function for auto chat, streaming new messages to the front-end."""
                 global character_prompts  # Access the global variable
@@ -1312,6 +1392,16 @@ def main():
                             history_fetched, summary_fetched = retrieve_session_data(session_id_value)
                             history_fetched = add_name_to_history(history_fetched)
                             logger.debug(f"Auto_chat fetched history after new message: {history_fetched}")
+
+                            # Append the new assistant message
+                            history_fetched.append(new_message)
+                            logger.debug(f"Appended new assistant message to history: {new_message}")
+
+                            # Store the updated session data
+                            store_session_data(session_id_value, history_fetched, summary_fetched)
+                            logger.debug("Character response stored in session data.")
+
+                            # Format history for display
                             formatted_history = format_history_for_display(history_fetched)
                             character_info = update_character_info()
 
@@ -1339,16 +1429,38 @@ def main():
                     except queue.Empty:
                         continue  # No new messages, continue waiting
 
+            # Event: Start auto chat
             start_auto_button.click(
                 handle_start_auto_chat,
-                inputs=[selected_characters, session_id_dropdown],  # Remove 'history' from inputs
+                inputs=[selected_characters, session_id_dropdown],
                 outputs=[chatbot, history, summary, user_input, character_info_display, assistant_character],
-                queue=True
+                 queue=True
             )
 
             # Event: Stop auto chat
             def handle_stop_auto_chat():
-                return stop_auto_chat()
+                """Stop the auto chat thread."""
+                global auto_mode_active
+                if not auto_mode_active:
+                    logger.info("Auto chat is not active.")
+                    return (
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        "Assistant",
+                        gr.update(value="User")  # Ensure user_name remains a string
+                    )
+                auto_mode_active = False
+                logger.info("Auto chat stopped.")
+                return (
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    "Assistant",
+                    gr.update(value="User")  # Ensure user_name remains a string
+                )
 
             stop_auto_button.click(
                 handle_stop_auto_chat,
@@ -1367,7 +1479,148 @@ def main():
                 outputs=assistant_character
             )
 
-            # Slideshow Functions (No changes needed here)
+                        # Slideshow Functions
+            def enter_slideshow(session_id_value):
+                """Function to enter slideshow mode."""
+                logger.debug(f"Entering slideshow mode with session_id: {session_id_value}")
+                try:
+                    if not session_id_value:
+                        logger.warning("No session selected for slideshow.")
+                        return (
+                            gr.update(visible=True),
+                            gr.update(visible=False),
+                            0
+                        )
+                    with session_lock:
+                        history_value, _ = retrieve_session_data(session_id_value)
+                        if not history_value:
+                            logger.warning("No history available for slideshow.")
+                            return (
+                                gr.update(visible=True),
+                                gr.update(visible=False),
+                                0
+                            )
+                        # Initialize slideshow_index to the last message
+                        initial_index = len(history_value) - 1 if history_value else 0
+                        # Update slideshow_text with the current message
+                        message = history_value[initial_index]
+                        display_text = f"""**{message['name']}**  
+_{message['timestamp']}_
+
+{message['content']}"""
+                        slideshow_text.value = display_text
+                    return (
+                        gr.update(visible=False),  # Hide chat_container
+                        gr.update(visible=True),   # Show slideshow_container
+                        initial_index               # Initialize slideshow_index to last message
+                    )
+                except Exception as e:
+                    logger.error(f"Error entering slideshow: {e}")
+                    logger.debug(traceback.format_exc())
+                    return gr.update(visible=True), gr.update(visible=False), 0
+
+            def update_slideshow(index, history):
+                """Update the slideshow display based on the current index."""
+                logger.debug(f"Updating slideshow at index: {index}")
+                try:
+                    if not history:
+                        logger.warning("No messages to display in slideshow.")
+                        return "No messages to display.", index
+                    # Adjust index if out of bounds
+                    index = max(0, min(index, len(history) - 1))
+                    message = history[index]
+                    display_text = f"""**{message['name']}**  
+_{message['timestamp']}_
+
+{message['content']}"""
+                    logger.debug(f"Displaying message: {display_text}")
+                    return display_text, index
+                except Exception as e:
+                    logger.error(f"Error updating slideshow: {e}")
+                    logger.debug(traceback.format_exc())
+                    return "Error displaying message.", index
+
+            def prev_slideshow(index, history):
+                """Go to the previous message in the slideshow."""
+                logger.debug("Navigating to previous message in slideshow.")
+                if index > 0:
+                    index -= 1
+                return update_slideshow(index, history)
+
+            def next_slideshow(index, history):
+                """Go to the next message in the slideshow."""
+                logger.debug("Navigating to next message in slideshow.")
+                if index < len(history) - 1:
+                    index += 1
+                return update_slideshow(index, history)
+
+            def first_slideshow(history):
+                """Go to the first message in the slideshow."""
+                logger.debug("Navigating to first message in slideshow.")
+                return update_slideshow(0, history)
+
+            def last_slideshow(history):
+                """Go to the last message in the slideshow."""
+                logger.debug("Navigating to last message in slideshow.")
+                last_index = len(history) - 1 if history else 0
+                return update_slideshow(last_index, history)
+
+            def exit_slideshow():
+                """Exit slideshow mode and return to chat interface."""
+                logger.debug("Exiting slideshow mode.")
+                return (
+                    gr.update(visible=True),   # Show chat_container
+                    gr.update(visible=False),  # Hide slideshow_container
+                )
+
+            # Slideshow Button Click
+            slideshow_button.click(
+                enter_slideshow,
+                inputs=session_id_dropdown,  # Pass session_id_dropdown's value directly
+                outputs=[chat_container, slideshow_container, slideshow_index]
+            )
+
+            # Previous Button Click
+            prev_button.click(
+                prev_slideshow,
+                inputs=[slideshow_index, history],
+                outputs=[slideshow_text, slideshow_index]
+            )
+
+            # Next Button Click
+            next_button.click(
+                next_slideshow,
+                inputs=[slideshow_index, history],
+                outputs=[slideshow_text, slideshow_index]
+            )
+
+            # First Button Click
+            first_button.click(
+                first_slideshow,
+                inputs=[history],
+                outputs=[slideshow_text, slideshow_index]
+            )
+
+            # Last Button Click
+            last_button.click(
+                last_slideshow,
+                inputs=[history],
+                outputs=[slideshow_text, slideshow_index]
+            )
+
+            # Back Button Click
+            back_button.click(
+                exit_slideshow,
+                inputs=None,
+                outputs=[chat_container, slideshow_container]
+            )
+
+            # Slideshow Display Update on Slideshow Index Change
+            slideshow_index.change(
+                update_slideshow,
+                inputs=[slideshow_index, history],
+                outputs=[slideshow_text, slideshow_index]
+            )
 
         logger.info("Launching Gradio app.")
         # Launch Gradio with share=False for local access
