@@ -17,13 +17,13 @@ import atexit
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "vanilj/midnight-miqu-70b-v1.5:latest"  # The model version
+MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # The model version
 CHARACTER_DIR = 'characters'  # Directory where character text files are stored
 LOG_FILE = 'app.log'  # Log file path
 
 # Summarization settings (configurable)
-MAX_CONTEXT_LENGTH = 100000  # Max context length before summarizing
-DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 8  # Configurable number of recent messages to keep in history after summarizing
+MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
+DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 20  # Configurable number of recent messages to keep in history after summarizing
 SUMMARY_PROMPT_TEMPLATE = (
     "Please provide a concise but comprehensive summary of the following conversation, "
     "including all important details, timestamps, and topics discussed:\n{conversation}\nSummary:"
