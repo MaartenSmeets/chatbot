@@ -180,60 +180,143 @@ def load_all_character_prompts():
 
 # SQLite DB functions for long-term memory storage
 def init_db():
-    """Initialize SQLite database for storing conversation summaries and histories."""
+    """Initialize SQLite database for storing conversation summaries and messages."""
     with sqlite3.connect('memory.db') as conn:
         cursor = conn.cursor()
+        # Create sessions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                history TEXT,
-                summary TEXT
+                session_id TEXT PRIMARY KEY
+            )
+        ''')
+        # Create messages table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                role TEXT,
+                name TEXT,
+                content TEXT,
+                timestamp TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+            )
+        ''')
+        # Create summaries table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                summary TEXT,
+                timestamp TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
             )
         ''')
         conn.commit()
-    logger.info("Initialized SQLite database and ensured 'sessions' table exists.")
+    logger.info("Initialized SQLite database and ensured required tables exist.")
 
-# SQLite DB functions for long-term memory storage
-def store_session_data(session_id, history, summary):
-    """Store session data including history and summary in SQLite database."""
-    history_json = json.dumps(history)
+def create_session(session_id):
+    """Create a new session in the sessions table."""
     with sqlite3.connect('memory.db') as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            REPLACE INTO sessions (session_id, history, summary)
-            VALUES (?, ?, ?)
-        ''', (session_id, history_json, summary))
+            INSERT OR IGNORE INTO sessions (session_id) VALUES (?)
+        ''', (session_id,))
         conn.commit()
-    
-    # Add debug log to confirm data is being stored
-    logger.debug(f"Stored session data for session_id: {session_id} with history: {history} and summary: {summary}")
-    
-    # Add debug log to confirm data is being stored
-    logger.debug(f"Stored session data for session_id: {session_id} with history: {history} and summary: {summary}")
+    logger.debug(f"Created session with session_id: {session_id}")
 
-def retrieve_session_data(session_id):
-    """Retrieve session data including history and summary from SQLite database."""
+def store_message(session_id, message):
+    """Store a single message in the messages table."""
     with sqlite3.connect('memory.db') as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT history, summary FROM sessions WHERE session_id = ?
+            INSERT INTO messages (session_id, role, name, content, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (session_id, message['role'], message['name'], message['content'], message['timestamp']))
+        conn.commit()
+    logger.debug(f"Stored message for session_id: {session_id}: {message}")
+
+def retrieve_messages(session_id):
+    """Retrieve all messages for a session_id."""
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT role, name, content, timestamp FROM messages WHERE session_id = ? ORDER BY id ASC
+        ''', (session_id,))
+        rows = cursor.fetchall()
+    messages = []
+    for row in rows:
+        message = {
+            'role': row[0],
+            'name': row[1],
+            'content': row[2],
+            'timestamp': row[3]
+        }
+        messages.append(message)
+    logger.debug(f"Retrieved messages for session_id: {session_id}: {messages}")
+    return messages
+
+def store_summary(session_id, summary_text):
+    """Store a summary in the summaries table."""
+    timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO summaries (session_id, summary, timestamp)
+            VALUES (?, ?, ?)
+        ''', (session_id, summary_text, timestamp))
+        conn.commit()
+    logger.debug(f"Stored summary for session_id: {session_id}: {summary_text}")
+
+def retrieve_latest_summary(session_id):
+    """Retrieve the latest summary for a session_id."""
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT summary FROM summaries WHERE session_id = ? ORDER BY id DESC LIMIT 1
         ''', (session_id,))
         row = cursor.fetchone()
     if row:
-        history_json, summary = row
-        history = json.loads(history_json) if history_json else []
-        logger.debug(f"Retrieved session data for session_id: {session_id}: {history}")
-        return history, summary
-    logger.debug(f"No session data found for session_id: {session_id}")
-    return [], ""
+        summary = row[0]
+        logger.debug(f"Retrieved latest summary for session_id: {session_id}: {summary}")
+        return summary
+    else:
+        logger.debug(f"No summary found for session_id: {session_id}")
+        return ""
 
 def delete_session_data(session_id):
     """Delete session data from SQLite database."""
     with sqlite3.connect('memory.db') as conn:
         cursor = conn.cursor()
+        cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
+        cursor.execute('DELETE FROM summaries WHERE session_id = ?', (session_id,))
         cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
         conn.commit()
     logger.info(f"Deleted session data for session_id: {session_id}")
+
+def delete_messages(session_id):
+    """Delete all messages for a session_id."""
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
+        conn.commit()
+    logger.debug(f"Deleted all messages for session_id: {session_id}")
+
+def delete_summaries(session_id):
+    """Delete all summaries for a session_id."""
+    with sqlite3.connect('memory.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM summaries WHERE session_id = ?', (session_id,))
+        conn.commit()
+    logger.debug(f"Deleted all summaries for session_id: {session_id}")
+
+def retrieve_session_data(session_id):
+    """Retrieve session data including history and summary from SQLite database."""
+    # Retrieve messages
+    history = retrieve_messages(session_id)
+    # Retrieve the latest summary
+    summary = retrieve_latest_summary(session_id)
+    # Return
+    return history, summary
 
 # Function to add 'name' and 'timestamp' to history if missing
 def add_name_to_history(history):
@@ -286,12 +369,9 @@ def create_new_session(character_prompts):
     logger.debug("Creating new session")
     # Generate a new session ID
     new_session_id = str(uuid.uuid4())
-    # Initialize session data
-    history = []
-    summary = ""
-    # Store initial session data
-    store_session_data(new_session_id, history, summary)
-    logger.debug(f"Stored session data for new session ID: {new_session_id}")
+    # Create the new session in the database
+    create_session(new_session_id)
+    logger.debug(f"Created session with ID: {new_session_id}")
     # Update session dropdown choices
     existing_sessions = get_existing_sessions()
     logger.debug(f"Updated session list after creation: {existing_sessions}")
@@ -305,9 +385,9 @@ def create_new_session(character_prompts):
 
     return (
         gr.update(choices=existing_sessions, value=new_session_id),  # session_id_dropdown
-        gr.update(value=format_history_for_display(history)),       # chatbot
-        history,                                                   # history state
-        summary,                                                   # summary state
+        gr.update(value=[]),       # chatbot
+        [],                        # history state
+        "",                        # summary state
         gr.update(value=character_info),                           # character_info_display
         assistant_char,                                             # assistant_character state
         gr.update(value=user_name_value)                           # user_name state
@@ -391,12 +471,14 @@ def reset_chat(session_id, character_prompts):
     """Reset the chat history and summary without deleting the session."""
     logger.debug(f"Resetting chat for session ID: {session_id}")
     # Clear the chat history and summary
-    history = []
-    summary = ""
-    # Update the session data to reset history and summary
-    if session_id:
-        store_session_data(session_id, history, summary)
-        logger.debug(f"Session data reset for session ID: {session_id}")
+    # Delete messages for the session
+    delete_messages(session_id)
+    logger.debug("Deleted all messages for the session.")
+
+    # Delete summaries for the session
+    delete_summaries(session_id)
+    logger.debug("Deleted all summaries for the session.")
+
     # Update character info display
     character_info = update_character_info()
     # Determine assistant character after reset
@@ -405,16 +487,19 @@ def reset_chat(session_id, character_prompts):
     # Return updated components
     logger.debug("Returning updated components after resetting the chat.")
     return (
-        gr.update(value=format_history_for_display(history)),  # chatbot
-        history,                                             # history
-        summary,                                             # summary
-        "",                                                  # user_input
-        gr.update(value=character_info),                     # character_info_display
-        assistant_char                                       # assistant_character state
+        gr.update(value=[]),                    # chatbot
+        [],                                     # history
+        "",                                     # summary
+        "",                                     # user_input
+        gr.update(value=character_info),        # character_info_display
+        assistant_char                          # assistant_character state
     )
 
 # Queue for new messages to be processed by Gradio
 new_message_queue = queue.Queue()
+
+# Event to signal new assistant messages
+new_assistant_message_event = threading.Event()
 
 # Function to handle user input
 def respond(user_input, history, summary, session_id, assistant_character, user_name):
@@ -469,9 +554,9 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
             history.append(user_message)
             logger.debug(f"Appended user message to history in auto mode: {user_message}")
 
-            # Store the updated session data
-            store_session_data(session_id, history, summary)
-            logger.debug("Updated session data stored in auto mode.")
+            # Store the message in the database
+            store_message(session_id, user_message)
+            logger.debug("Stored user message in the database in auto mode.")
 
             # Enqueue the user message to the new_message_queue
             new_message_queue.put(user_message)
@@ -498,9 +583,9 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
             history.append(user_message)
             logger.debug(f"Appended user message to history: {user_message}")
 
-            # Store the updated session data
-            store_session_data(session_id, history, summary)
-            logger.debug("Updated session data stored.")
+            # Store the message in the database
+            store_message(session_id, user_message)
+            logger.debug("Stored user message in the database.")
 
     # Generate response from LLM outside the lock to prevent blocking
     character_name = assistant_character if assistant_character else "Assistant"
@@ -533,16 +618,16 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
         history.append(assistant_message)
         logger.debug(f"Appended assistant message to history: {assistant_message}")
 
-        # Store the updated session data with the character's response
-        store_session_data(session_id, history, summary)
-        logger.debug("Character response stored in session data.")
+        # Store the assistant message in the database
+        store_message(session_id, assistant_message)
+        logger.debug("Stored assistant message in the database.")
 
         # Enqueue the assistant message to the new_message_queue
-        new_message_queue.put(assistant_message)
-        logger.debug("Enqueued assistant message to new_message_queue.")
+        new_assistant_message_event.set()
+        logger.debug("Set new_assistant_message_event.")
 
         # Fetch the latest history from the database
-        history_fetched, summary_fetched = retrieve_session_data(session_id)
+        history_fetched = retrieve_messages(session_id)
         history_fetched = add_name_to_history(history_fetched)
         logger.debug(f"After assistant response, fetched history: {history_fetched}")
         formatted_history = format_history_for_display(history_fetched)
@@ -553,7 +638,7 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
     return (
         gr.update(value=formatted_history),      # chatbot
         history_fetched,                         # history state
-        summary_fetched,                         # summary state
+        summary,                                 # summary state
         "",                                      # user_input
         gr.update(value=character_info),         # character_info_display
         assistant_character                      # assistant_character state
@@ -643,20 +728,23 @@ def stop_auto_chat():
             gr.update(),
             gr.update(),
             gr.update(),
-            "Assistant"
+            "Assistant",
+            gr.update(value="User")  # Ensure user_name remains a string
         )
     auto_mode_active = False
+    new_assistant_message_event.set()  # Unblock the generator if waiting
     logger.info("Auto chat stopped.")
     return (
         gr.update(),
         gr.update(),
         gr.update(),
         gr.update(),
-        "Assistant"
+        "Assistant",
+        gr.update(value="User")  # Ensure user_name remains a string
     )
 
 # Function to summarize the conversation history
-def summarize_history(history, summary, system_prompt, model, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP):
+def summarize_history(history, summary, system_prompt, model, session_id, num_recent=DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP):
     """Summarize the conversation history using the LLM."""
     logger.info("Summarizing conversation history.")
     # Prepare the conversation text excluding system messages
@@ -686,6 +774,11 @@ def summarize_history(history, summary, system_prompt, model, num_recent=DEFAULT
             summary = generate_response_with_llm(summarization_prompt, history, summary, system_prompt, model)
 
     logger.debug(f"Generated summary from LLM: {summary}")
+
+    # Store the summary in the database
+    store_summary(session_id, summary)
+    logger.debug("Stored the new summary in the database.")
+
     return summary.strip()
 
 # Function to generate a response from the LLM
@@ -847,21 +940,12 @@ def auto_chat(selected_characters, session_id):
 
             # Acquire the lock to safely access the history
             with session_lock:
-                history_fetched, summary_fetched = retrieve_session_data(session_id)
+                history_fetched = retrieve_messages(session_id)
                 history_fetched = add_name_to_history(history_fetched)
                 logger.debug(f"Auto_chat retrieved history: {history_fetched}")
 
-                # Prepare user_prompt from the last message or default
-                if history_fetched and history_fetched[-1]['role'] == 'assistant':
-                    user_prompt = history_fetched[-1]['content']
-                elif history_fetched and history_fetched[-1]['role'] == 'user':
-                    user_prompt = history_fetched[-1]['content']
-                else:
-                    # No history, instruct LLM to start the conversation
-                    user_prompt = ""
-
             # Generate response from LLM
-            response = generate_response_with_llm(user_prompt, history_fetched, summary_fetched, current_character_prompt, MODEL_NAME)
+            response = generate_response_with_llm("", history_fetched, "", current_character_prompt, MODEL_NAME)
 
             if not response:
                 response = "I'm sorry, I couldn't process your request."
@@ -875,17 +959,22 @@ def auto_chat(selected_characters, session_id):
             # Get current timestamp
             timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
 
-            # Prepare assistant message
+            # Prepare assistant message with correct role
             assistant_message = {
-                "role": "assistant",
+                "role": "assistant",  # Ensure role is 'assistant'
                 "content": response,
                 "name": current_character_name,
                 "timestamp": timestamp
             }
 
-            # Enqueue the assistant message to the new_message_queue
-            new_message_queue.put(assistant_message)
-            logger.debug(f"Enqueued assistant message to new_message_queue: {assistant_message}")
+            # Append the assistant message to history within the lock
+            with session_lock:
+                # Store the assistant message in the database
+                store_message(session_id, assistant_message)
+                logger.debug("Stored assistant message in the database.")
+
+            # Signal the frontend about the new assistant message
+            new_assistant_message_event.set()
 
             # Move to next character
             current_index = (current_index + 1) % len(selected_characters)
@@ -1341,14 +1430,16 @@ def main():
                 outputs=[chatbot, history, summary, user_input, character_info_display, assistant_character]
             )
 
+            # Event: Start auto chat
             def handle_start_auto_chat(selected_characters_value, session_id_value):
                 """Generator function for auto chat, streaming new messages to the front-end."""
                 global character_prompts  # Access the global variable
 
                 logger.debug(f"Starting auto-chat for session_id: {session_id_value} with selected_characters: {selected_characters_value}")
 
-                # Start the auto chat thread
-                start_auto_chat(selected_characters_value, session_id_value)
+                # Start the auto chat thread if not already active
+                if not auto_mode_active:
+                    start_auto_chat(selected_characters_value, session_id_value)
 
                 # Initial fetch of history and summary
                 with session_lock:
@@ -1380,26 +1471,16 @@ def main():
                     assistant_char                       # assistant_character state
                 )
 
-                # Continuously yield updates as new messages arrive
+                # Continuously yield updates as new assistant messages arrive
                 while auto_mode_active:
-                    try:
-                        new_message = new_message_queue.get(timeout=1)  # Blocking wait for new message
-
-                        logger.debug(f"New auto-chat message received: {new_message}")
-
+                    # Wait for the event to be set
+                    event_set = new_assistant_message_event.wait(timeout=1)
+                    if event_set:
                         with session_lock:
                             # Fetch the latest history from the database
                             history_fetched, summary_fetched = retrieve_session_data(session_id_value)
                             history_fetched = add_name_to_history(history_fetched)
                             logger.debug(f"Auto_chat fetched history after new message: {history_fetched}")
-
-                            # Append the new assistant message
-                            history_fetched.append(new_message)
-                            logger.debug(f"Appended new assistant message to history: {new_message}")
-
-                            # Store the updated session data
-                            store_session_data(session_id_value, history_fetched, summary_fetched)
-                            logger.debug("Character response stored in session data.")
 
                             # Format history for display
                             formatted_history = format_history_for_display(history_fetched)
@@ -1426,15 +1507,18 @@ def main():
                             gr.update(value=character_info),     # character_info_display
                             assistant_char                      # assistant_character state
                         )
-                    except queue.Empty:
-                        continue  # No new messages, continue waiting
+
+                        # Clear the event
+                        new_assistant_message_event.clear()
+                    else:
+                        continue  # Timeout, no new messages
 
             # Event: Start auto chat
             start_auto_button.click(
                 handle_start_auto_chat,
                 inputs=[selected_characters, session_id_dropdown],
                 outputs=[chatbot, history, summary, user_input, character_info_display, assistant_character],
-                 queue=True
+                queue=True
             )
 
             # Event: Stop auto chat
