@@ -1088,17 +1088,39 @@ def main():
                         delete_session_button = gr.Button("Delete Session")
                         slideshow_button = gr.Button("Slideshow")  # Added Slideshow Button
 
-                    character_selection_order = gr.State([])
+                    # User name input and assistant character selection
+                    with gr.Row():
+                        user_name_input = gr.Textbox(
+                            label="Your Name",
+                            value="User",
+                            placeholder="Enter your name",
+                            interactive=True
+                        )
+                        assistant_character_dropdown = gr.Dropdown(
+                            choices=character_names,
+                            label="Select Assistant Character",
+                            value=None,
+                            interactive=True
+                        )
+
+                    # Update user_name state when user_name_input changes
+                    user_name_input.change(
+                        lambda x: x.strip() if x.strip() else "User",
+                        inputs=user_name_input,
+                        outputs=user_name
+                    )
 
                     # Auto chat controls
-                    with gr.Row():
-                        with gr.Column():
+                    with gr.Group():
+                        gr.Markdown("### Auto Chat Controls")
+                        with gr.Row():
                             selected_characters = gr.CheckboxGroup(
                                 choices=character_names,
-                                label="Select Characters for Auto Chat (Selection order determines speaking order)",
+                                label="Select Characters for Auto Chat (Order determines speaking order)",
                                 value=[]
                             )
                             participant_order = gr.Markdown("Current speaking order: None")
+                        with gr.Row():
                             start_auto_button = gr.Button("Start Auto Chat")
                             stop_auto_button = gr.Button("Stop Auto Chat")
 
@@ -1115,30 +1137,6 @@ def main():
                         inputs=[selected_characters],
                         outputs=[participant_order]
                     )
-
-                    # Assistant character selection
-                    with gr.Row():
-                        assistant_character_dropdown = gr.Dropdown(
-                            choices=character_names,  # Updated to show only names
-                            label="Select Assistant Character",
-                            value=None,
-                            interactive=True
-                        )
-
-                    # User name input
-                    with gr.Row():
-                        user_name_input = gr.Textbox(
-                            label="Your Name",
-                            value="User",
-                            placeholder="Enter your name",
-                            interactive=True
-                        )
-                        # Update user_name state when user_name_input changes
-                        user_name_input.change(
-                            lambda x: x.strip() if x.strip() else "User",
-                            inputs=user_name_input,
-                            outputs=user_name
-                        )
 
                     # Initialize Chatbot with 'messages' type
                     chatbot = gr.Chatbot(type='messages', elem_id='chatbot')
