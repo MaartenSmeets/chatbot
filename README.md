@@ -16,7 +16,7 @@ This repository contains a Python application that implements a multi-character 
 
 - **Python 3.7 or higher**
 - **[Ollama](https://ollama.ai/docs/installation)** installed and running at `http://localhost:11434`
-- **[Ollama Llama3.1 Model](https://ollama.ai/models/llama2](https://ollama.com/library/llama3.1)**: Ensure the `llama3.1:70b-instruct-q4_K_M` model is available in Ollama.
+- **[Ollama Llama3.1 Model](https://ollama.com/library/llama3.1)**: Ensure the `llama3.1:70b-instruct-q4_K_M` model is available in Ollama.
 
 ### Steps
 
