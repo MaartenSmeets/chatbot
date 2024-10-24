@@ -925,7 +925,6 @@ def auto_chat(selected_characters, session_id):
     """Background thread function to handle automatic chatting."""
     global auto_mode_active, character_prompts  # Access global variables
 
-    current_index = 0
     try:
         logger.debug(f"Auto chat started with session_id: {session_id}")
 
@@ -934,54 +933,51 @@ def auto_chat(selected_characters, session_id):
                 logger.warning("No characters selected for auto chat.")
                 break
 
-            current_character_name = selected_characters[current_index]
-            current_character_prompt = character_prompts.get(current_character_name, "")
-            logger.debug(f"Current character for auto chat: {current_character_name}")
+            # Iterate through characters in their selected order
+            for current_character_name in selected_characters:
+                if not auto_mode_active:
+                    break
 
-            # Acquire the lock to safely access the history
-            with session_lock:
-                history_fetched = retrieve_messages(session_id)
-                history_fetched = add_name_to_history(history_fetched)
-                logger.debug(f"Auto_chat retrieved history: {history_fetched}")
+                current_character_prompt = character_prompts.get(current_character_name, "")
+                logger.debug(f"Current character for auto chat: {current_character_name}")
 
-            # Generate response from LLM
-            response = generate_response_with_llm("", history_fetched, "", current_character_prompt, MODEL_NAME)
+                # Acquire the lock to safely access the history
+                with session_lock:
+                    history_fetched = retrieve_messages(session_id)
+                    history_fetched = add_name_to_history(history_fetched)
+                    logger.debug(f"Auto_chat retrieved history: {history_fetched}")
 
-            if not response:
-                response = "I'm sorry, I couldn't process your request."
-                logger.warning(f"Empty response from LLM for {current_character_name}. Using default message.")
-            else:
-                response = remove_timestamps_from_response(response)
-                response = remove_leading_name_from_response(response, current_character_name)
-                response = clean_response(response)  # Clean unwanted markdown code fences
-                logger.debug(f"Processed LLM response for {current_character_name}: {response}")
+                # Generate response from LLM
+                response = generate_response_with_llm("", history_fetched, "", current_character_prompt, MODEL_NAME)
 
-            # Get current timestamp
-            timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
+                if not response:
+                    response = "I'm sorry, I couldn't process your request."
+                    logger.warning(f"Empty response from LLM for {current_character_name}. Using default message.")
+                else:
+                    response = remove_timestamps_from_response(response)
+                    response = remove_leading_name_from_response(response, current_character_name)
+                    response = clean_response(response)
+                    logger.debug(f"Processed LLM response for {current_character_name}: {response}")
 
-            # Prepare assistant message with correct role
-            assistant_message = {
-                "role": "assistant",  # Ensure role is 'assistant'
-                "content": response,
-                "name": current_character_name,
-                "timestamp": timestamp
-            }
+                # Get current timestamp
+                timestamp = datetime.now().strftime("%d-%m-%Y %H:%M")
 
-            # Append the assistant message to history within the lock
-            with session_lock:
-                # Store the assistant message in the database
-                store_message(session_id, assistant_message)
-                logger.debug("Stored assistant message in the database.")
+                # Prepare assistant message with correct role
+                assistant_message = {
+                    "role": "assistant",
+                    "content": response,
+                    "name": current_character_name,
+                    "timestamp": timestamp
+                }
 
-            # Signal the frontend about the new assistant message
-            new_assistant_message_event.set()
+                # Append the assistant message to history within the lock
+                with session_lock:
+                    store_message(session_id, assistant_message)
+                    logger.debug("Stored assistant message in the database.")
 
-            # Move to next character
-            current_index = (current_index + 1) % len(selected_characters)
-            logger.debug(f"Moving to next character index: {current_index}")
+                # Signal the frontend about the new assistant message
+                new_assistant_message_event.set()
 
-            # Sleep to simulate conversation flow
-            time.sleep(5)  # Adjust the delay as needed
     except Exception as e:
         logger.error(f"Exception in auto_chat thread: {e}")
         logger.debug(traceback.format_exc())
@@ -1092,14 +1088,33 @@ def main():
                         delete_session_button = gr.Button("Delete Session")
                         slideshow_button = gr.Button("Slideshow")  # Added Slideshow Button
 
+                    character_selection_order = gr.State([])
+
                     # Auto chat controls
                     with gr.Row():
-                        selected_characters = gr.CheckboxGroup(
-                            choices=character_names,  # Updated to show only names
-                            label="Select Characters for Auto Chat"
-                        )
-                        start_auto_button = gr.Button("Start Auto Chat")
-                        stop_auto_button = gr.Button("Stop Auto Chat")
+                        with gr.Column():
+                            selected_characters = gr.CheckboxGroup(
+                                choices=character_names,
+                                label="Select Characters for Auto Chat (Selection order determines speaking order)",
+                                value=[]
+                            )
+                            participant_order = gr.Markdown("Current speaking order: None")
+                            start_auto_button = gr.Button("Start Auto Chat")
+                            stop_auto_button = gr.Button("Stop Auto Chat")
+
+                    # Function to update participant order display
+                    def update_participant_order(selected):
+                        if not selected:
+                            return "Current speaking order: None"
+                        order_text = "Current speaking order: " + " → ".join(selected)
+                        return order_text
+
+                    # Update participant order when selection changes
+                    selected_characters.change(
+                        update_participant_order,
+                        inputs=[selected_characters],
+                        outputs=[participant_order]
+                    )
 
                     # Assistant character selection
                     with gr.Row():
@@ -1431,14 +1446,15 @@ def main():
             )
 
             # Event: Start auto chat
+             # Event: Start auto chat with ordered participants
             def handle_start_auto_chat(selected_characters_value, session_id_value):
                 """Generator function for auto chat, streaming new messages to the front-end."""
-                global character_prompts  # Access the global variable
+                global character_prompts
 
-                logger.debug(f"Starting auto-chat for session_id: {session_id_value} with selected_characters: {selected_characters_value}")
+                logger.debug(f"Starting auto-chat for session_id: {session_id_value} with ordered characters: {selected_characters_value}")
 
-                # Start the auto chat thread if not already active
                 if not auto_mode_active:
+                    # Pass the characters in their selected order
                     start_auto_chat(selected_characters_value, session_id_value)
 
                 # Initial fetch of history and summary
@@ -1458,35 +1474,26 @@ def main():
                     if not assistant_char and character_prompts:
                         assistant_char = next(iter(character_prompts))
 
-                    logger.debug(f"Initial formatted history: {formatted_history}")
-                    logger.debug(f"Initial assistant character: {assistant_char}")
-
-                # Initial yield to set up the session in the front-end
+                # Initial yield
                 yield (
-                    gr.update(value=formatted_history),  # chatbot
-                    history_fetched,                      # history state
-                    summary_fetched,                      # summary state
-                    "",                                   # user_input cleared
-                    gr.update(value=character_info),      # character_info_display
-                    assistant_char                       # assistant_character state
+                    gr.update(value=formatted_history),
+                    history_fetched,
+                    summary_fetched,
+                    "",
+                    gr.update(value=character_info),
+                    assistant_char
                 )
 
-                # Continuously yield updates as new assistant messages arrive
+                # Continuous updates
                 while auto_mode_active:
-                    # Wait for the event to be set
                     event_set = new_assistant_message_event.wait(timeout=1)
                     if event_set:
                         with session_lock:
-                            # Fetch the latest history from the database
                             history_fetched, summary_fetched = retrieve_session_data(session_id_value)
                             history_fetched = add_name_to_history(history_fetched)
-                            logger.debug(f"Auto_chat fetched history after new message: {history_fetched}")
-
-                            # Format history for display
                             formatted_history = format_history_for_display(history_fetched)
                             character_info = update_character_info()
 
-                            # Determine assistant character from updated history
                             assistant_char = None
                             for msg in reversed(history_fetched):
                                 if msg['role'] == 'assistant':
@@ -1496,22 +1503,26 @@ def main():
                             if not assistant_char and character_prompts:
                                 assistant_char = next(iter(character_prompts))
 
-                            logger.debug(f"Assistant character after new message: {assistant_char}")
-
-                        # Yield the updated history to the front-end
                         yield (
-                            gr.update(value=formatted_history),  # chatbot
-                            history_fetched,                     # history state
-                            summary_fetched,                     # summary state
-                            "",                                  # user_input (no change)
-                            gr.update(value=character_info),     # character_info_display
-                            assistant_char                      # assistant_character state
+                            gr.update(value=formatted_history),
+                            history_fetched,
+                            summary_fetched,
+                            "",
+                            gr.update(value=character_info),
+                            assistant_char
                         )
 
-                        # Clear the event
                         new_assistant_message_event.clear()
                     else:
-                        continue  # Timeout, no new messages
+                        continue
+
+            # Connect start button to handler
+            start_auto_button.click(
+                handle_start_auto_chat,
+                inputs=[selected_characters, session_id_dropdown],
+                outputs=[chatbot, history, summary, user_input, character_info_display, assistant_character],
+                queue=True
+            )
 
             # Event: Start auto chat
             start_auto_button.click(
