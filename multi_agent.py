@@ -14,6 +14,7 @@ import threading
 import time
 import queue
 import atexit
+import yaml
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
@@ -134,49 +135,37 @@ def ensure_character_directory():
 
 # Function to retrieve character files
 def get_character_files():
-    """Retrieve a list of character files from the character directory."""
+    """Retrieve a list of character YAML files from the character directory."""
     if not os.path.exists(CHARACTER_DIR):
         logger.error(f"Character directory '{CHARACTER_DIR}' does not exist.")
         return []
-    character_files = [f for f in os.listdir(CHARACTER_DIR) if f.endswith('.txt')]
+    character_files = [f for f in os.listdir(CHARACTER_DIR) if f.endswith('.yaml') or f.endswith('.yml')]
     logger.debug(f"Found character files: {character_files}")
     return character_files
 
-# Function to extract character name from file or prompt
-def get_character_name(character_file_or_prompt):
-    """Extract character name from character file name or prompt."""
-    if isinstance(character_file_or_prompt, str):
-        if character_file_or_prompt.endswith('.txt'):
-            return os.path.splitext(character_file_or_prompt)[0]
-        else:
-            # If it's a prompt, try to extract the name from "You are [Name]" or "[Name], ..." pattern
-            match = re.search(r"You are (\w+)", character_file_or_prompt)
-            if not match:
-                match = re.search(r"^(\w+),\s*", character_file_or_prompt)
-            if match:
-                return match.group(1)
-    return "Assistant"  # Default name if extraction fails
-
 # Function to load all character prompts
 def load_all_character_prompts():
-    """Load all character prompts and combine them into a single system prompt."""
+    """Load all character data from YAML files."""
     character_files = get_character_files()
-    character_prompts = {}
+    character_data = {}
 
     for file in character_files:
         try:
             with open(os.path.join(CHARACTER_DIR, file), 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                character_name = get_character_name(file)
-                character_prompts[character_name] = prompt.strip()
-                logger.debug(f"Loaded system prompt for '{character_name}' from '{file}'.")
+                data = yaml.safe_load(f)
+                character_name = data.get('name', None)
+                if not character_name:
+                    logger.warning(f"Character file '{file}' does not contain a 'name' field.")
+                    continue
+                character_data[character_name] = data
+                logger.debug(f"Loaded character data for '{character_name}' from '{file}'.")
         except FileNotFoundError:
             logger.error(f"Character file '{file}' not found.")
         except Exception as e:
             logger.error(f"Error loading character file '{file}': {e}")
             logger.debug(traceback.format_exc())
 
-    return character_prompts
+    return character_data
 
 # SQLite DB functions for long-term memory storage
 def init_db():
@@ -589,11 +578,13 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
 
     # Generate response from LLM outside the lock to prevent blocking
     character_name = assistant_character if assistant_character else "Assistant"
-    character_prompt = character_prompts.get(character_name, "") if character_prompts else ""
+    character_data = character_prompts.get(character_name, None) if character_prompts else None
 
-    logger.debug(f"Assistant Character: {character_name}, Prompt Length: {len(character_prompt)}")
-
-    response = generate_response_with_llm(user_input, history, summary, character_prompt, MODEL_NAME)
+    if not character_data:
+        logger.error(f"Character data for '{character_name}' not found.")
+        response = "I'm sorry, I couldn't find the character data."
+    else:
+        response = generate_response_with_llm(user_input, history, summary, character_data, MODEL_NAME)
 
     if not response:
         response = "I'm sorry, I couldn't process your request."
@@ -782,88 +773,74 @@ def summarize_history(history, summary, system_prompt, model, session_id, num_re
     return summary.strip()
 
 # Function to generate a response from the LLM
-def generate_response_with_llm(user_prompt: str, history: list, summary: str, character_prompt: str, model: str) -> str:
+def generate_response_with_llm(user_input: str, history: list, summary: str, character_data: dict, model: str) -> str:
     """
-    Generate a response from the LLM based on the prompt, context (history), and memory (summary).
-    This function interacts with the Ollama API, uses proper message formatting, and leverages caching.
-    It sends a system message and a single user message containing the conversation history or instructions to start the conversation.
+    Generate a response from the LLM based on the character-specific templates and conversation context.
     """
-    logger.debug(f"Entered generate_response_with_llm with prompt size {len(user_prompt)}")
+    logger.debug(f"Entered generate_response_with_llm with prompt size {len(user_input)}")
     global cache
 
-    character_name = get_character_name(character_prompt)
+    character_name = character_data.get('name', 'Assistant')
+
+    # Build the system prompt
+    system_prompt = character_data['conversation']['system_prompt']
+
+    # Determine if there is valid conversation history to include
+    has_history = any(msg['role'] in ['user', 'assistant'] for msg in history)
+
+    if has_history:
+        # Build the conversation history string from the messages
+        conversation_history = ""
+        for message in history:
+            if message['role'] in ['user', 'assistant']:
+                timestamp = message.get('timestamp', '')
+                name = message.get('name', 'Unknown')
+                content = message.get('content', '')
+                conversation_history += f"[{timestamp}] {name}: {content}\n"
+
+        # Use the character-specific user prompt template
+        user_prompt_template = character_data['conversation'].get('user_prompt_template_regular', '')
+        # Fill in the placeholders
+        full_user_prompt = user_prompt_template.format(
+            conversation_history=conversation_history,
+            character_name=character_name
+        )
+    else:
+        # Use the character-specific start prompt template
+        user_prompt_template_start = character_data['conversation'].get('user_prompt_template_start', '')
+        full_user_prompt = user_prompt_template_start.format(
+            character_name=character_name
+        )
 
     # Generate a unique cache key based on the current state
-    cache_key = generate_cache_key(user_prompt, history, summary, character_prompt, model)
+    cache_key = generate_cache_key(full_user_prompt, history, summary, system_prompt, model)
     logger.debug(f"Generated cache key: {cache_key}")
-    
+
     # Attempt to fetch from cache
     with cache_lock:
         if cache and cache_key in cache:
-            logger.info(f"Fetching result from cache for prompt: {user_prompt[:50]}...")
+            logger.info(f"Fetching result from cache for prompt: {full_user_prompt[:50]}...")
             response_content = cache[cache_key]
             logger.debug(f"Cached response: {response_content}")
             return response_content
 
+    # Prepare the system and user messages for the LLM
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": full_user_prompt}
+    ]
+
+    payload = {
+        "model": model,
+        "messages": messages
+    }
+
+    logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(full_user_prompt)}")
+    logger.debug(f"Full payload:\n{json.dumps(payload, indent=2)}")
+
+    headers = {'Content-Type': 'application/json'}
+    # Enable streaming response with a timeout
     try:
-        # Determine if there is valid conversation history to include
-        has_history = any(msg['role'] in ['user', 'assistant'] for msg in history)
-
-        if has_history:
-            # Build the conversation history string from the messages
-            conversation_history = ""
-            for message in history:
-                if message['role'] in ['user', 'assistant']:
-                    timestamp = message.get('timestamp', '')
-                    name = message.get('name', 'Unknown')
-                    content = message.get('content', '')
-                    conversation_history += f"[{timestamp}] {name}: {content}\n"
-
-            # User prompt with context and guidelines
-            full_user_prompt = f"""
-===  
-Conversation history:  
-
-{conversation_history}  
-===  
-As {character_name}, respond to the latest message in a single line using the conversation history for context and guidance. If a recent earlier message is more relevant and still relevant to directly respond to, you can respond to that instead. 
-
-Guidelines:  
-1. Stay in character as {character_name}.  
-2. Use Markdown for formatting but do not mention markdown. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
-3. On your turn, you can choose to either just describe your feelings and actions or also speak.  
-4. Keep responses concise yet engaging.
-5. Do not start with Name: because the message will already include your name.
-"""
-        else:
-            # If there's no history, send a generic start-conversation prompt
-            logger.debug("No conversation history found, sending initial conversation start prompt.")
-            full_user_prompt = f"""
-As {character_name}, start a conversation with the user.  
-
-Guidelines:  
-1. Stay in character as {character_name}.  
-2. Use Markdown for formatting but do not mention markdown. Describe feelings and actions using *cursive* markdown (e.g., *this*).  
-3. Keep responses concise yet engaging.
-4. Do not start with Name: because the message will already include your name.
-"""
-
-        # Prepare the system and user messages for the LLM
-        messages = [
-            {"role": "system", "content": character_prompt},
-            {"role": "user", "content": full_user_prompt}
-        ]
-
-        payload = {
-            "model": model,
-            "messages": messages
-        }
-
-        logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(full_user_prompt)}")
-        logger.debug(f"Full payload:\n{json.dumps(payload, indent=2)}")
-
-        headers = {'Content-Type': 'application/json'}
-        # Enable streaming response with a timeout
         response = requests.post(OLLAMA_URL, data=json.dumps(payload), headers=headers, stream=True, timeout=60)
 
         logger.debug(f"Response status code: {response.status_code}")
@@ -938,7 +915,10 @@ def auto_chat(selected_characters, session_id):
                 if not auto_mode_active:
                     break
 
-                current_character_prompt = character_prompts.get(current_character_name, "")
+                current_character_data = character_prompts.get(current_character_name, None)
+                if not current_character_data:
+                    logger.error(f"Character data for '{current_character_name}' not found.")
+                    continue
                 logger.debug(f"Current character for auto chat: {current_character_name}")
 
                 # Acquire the lock to safely access the history
@@ -948,7 +928,7 @@ def auto_chat(selected_characters, session_id):
                     logger.debug(f"Auto_chat retrieved history: {history_fetched}")
 
                 # Generate response from LLM
-                response = generate_response_with_llm("", history_fetched, "", current_character_prompt, MODEL_NAME)
+                response = generate_response_with_llm("", history_fetched, "", current_character_data, MODEL_NAME)
 
                 if not response:
                     response = "I'm sorry, I couldn't process your request."
