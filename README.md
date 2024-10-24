@@ -54,7 +54,7 @@ This repository contains a Python application that implements a multi-character 
 6. **Run the Application**
 
    ```bash
-   python app.py
+   python multi_agent.py
    ```
 
    Replace `app.py` with the actual filename of the script.
