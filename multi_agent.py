@@ -21,6 +21,8 @@ OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpo
 MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # The model version
 CHARACTER_DIR = 'characters'  # Directory where character text files are stored
 LOG_FILE = 'app.log'  # Log file path
+# Configurable number of retries for LLM requests
+MAX_RETRIES = 3  # Set the desired number of retries
 
 # Summarization settings (configurable)
 MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
@@ -586,6 +588,20 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
     else:
         response = generate_response_with_llm(user_input, history, summary, character_data, MODEL_NAME)
 
+    if response == "/skip":
+        logger.info("LLM response was '/skip'. Not adding assistant message to history.")
+        # Do not add to history or database, just return
+        formatted_history = format_history_for_display(history)
+        character_info = update_character_info()
+        return (
+            gr.update(value=formatted_history),      # chatbot
+            history,                                 # history state
+            summary,                                 # summary state
+            "",                                      # user_input
+            gr.update(value=character_info),         # character_info_display
+            assistant_character                      # assistant_character state
+        )
+
     if not response:
         response = "I'm sorry, I couldn't process your request."
         logger.warning("Generated empty response from LLM. Using default message.")
@@ -776,6 +792,7 @@ def summarize_history(history, summary, system_prompt, model, session_id, num_re
 def generate_response_with_llm(user_input: str, history: list, summary: str, character_data: dict, model: str) -> str:
     """
     Generate a response from the LLM based on the character-specific templates and conversation context.
+    Implements retry mechanism and returns '/skip' if the LLM fails after retries.
     """
     logger.debug(f"Entered generate_response_with_llm with prompt size {len(user_input)}")
     global cache
@@ -835,67 +852,79 @@ def generate_response_with_llm(user_input: str, history: list, summary: str, cha
         "messages": messages
     }
 
-    logger.info(f"Sending request to LLM with model '{model}' and prompt size {len(full_user_prompt)}")
-    logger.debug(f"Full payload:\n{json.dumps(payload, indent=2)}")
-
     headers = {'Content-Type': 'application/json'}
-    # Enable streaming response with a timeout
-    try:
-        response = requests.post(OLLAMA_URL, data=json.dumps(payload), headers=headers, stream=True, timeout=60)
 
-        logger.debug(f"Response status code: {response.status_code}")
+    # Implement retry mechanism
+    retries = 0
+    while retries < MAX_RETRIES:
+        try:
+            logger.info(f"Attempt {retries + 1} to send request to LLM with model '{model}'")
+            logger.debug(f"Full payload:\n{json.dumps(payload, indent=2)}")
 
-        if response.status_code != 200:
-            logger.error(f"Failed to generate response with LLM: HTTP {response.status_code}")
-            logger.debug(f"Response content: {response.text}")
-            return ""
+            response = requests.post(OLLAMA_URL, data=json.dumps(payload), headers=headers, stream=True, timeout=60)
 
-        # Process the streaming response
-        response_content = ""
-        raw_response = []
-        for line in response.iter_lines():
-            if line:
-                try:
-                    line_decoded = line.decode('utf-8')
-                    raw_response.append(line_decoded)  # Store the raw line for debugging
-                    data = json.loads(line_decoded)
-                    # Check if 'message' field is present in the data
-                    if 'message' in data and 'content' in data['message']:
-                        response_content += data['message']['content']
-                    if data.get('done', False):
-                        break
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSONDecodeError: {e}")
-                    logger.debug(f"Line content: {line}")
-                    continue
+            logger.debug(f"Response status code: {response.status_code}")
 
-        # Check if the response content is empty
-        if not response_content.strip():
-            logger.warning("Received empty response from LLM.")
-            logger.debug(f"Complete raw response: {raw_response}")
-            return ""
+            if response.status_code != 200:
+                logger.error(f"Failed to generate response with LLM: HTTP {response.status_code}")
+                logger.debug(f"Response content: {response.text}")
+                retries += 1
+                continue  # Retry
 
-        # Cache the result if caching is enabled
-        if cache:
-            with cache_lock:
-                logger.debug("Caching the generated response.")
-                cache[cache_key] = response_content
-            cache.sync()
+            # Process the streaming response
+            response_content = ""
+            raw_response = []
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        line_decoded = line.decode('utf-8')
+                        raw_response.append(line_decoded)  # Store the raw line for debugging
+                        data = json.loads(line_decoded)
+                        # Check if 'message' field is present in the data
+                        if 'message' in data and 'content' in data['message']:
+                            response_content += data['message']['content']
+                        if data.get('done', False):
+                            break
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSONDecodeError: {e}")
+                        logger.debug(f"Line content: {line}")
+                        continue
 
-        logger.debug(f"Generated response from LLM: {response_content.strip()}")
-        return response_content.strip()
+            # Check if the response content is empty
+            if not response_content.strip():
+                logger.warning("Received empty response from LLM.")
+                logger.debug(f"Complete raw response: {raw_response}")
+                retries += 1
+                continue  # Retry
 
-    except requests.exceptions.Timeout:
-        logger.error("LLM API request timed out.")
-        return "I'm sorry, the request timed out. Please try again later."
-    except requests.exceptions.RequestException as e:
-        logger.error(f"LLM API request failed: {e}")
-        logger.debug(traceback.format_exc())
-        return "I'm sorry, there was an error processing your request."
-    except Exception as e:
-        logger.error(f"Failed to generate response with LLM: {e}")
-        logger.debug(traceback.format_exc())
-        return ""
+            # Cache the result if caching is enabled
+            if cache:
+                with cache_lock:
+                    logger.debug("Caching the generated response.")
+                    cache[cache_key] = response_content
+                cache.sync()
+
+            logger.debug(f"Generated response from LLM: {response_content.strip()}")
+            return response_content.strip()
+
+        except requests.exceptions.Timeout:
+            logger.error("LLM API request timed out.")
+            retries += 1
+            continue  # Retry
+        except requests.exceptions.RequestException as e:
+            logger.error(f"LLM API request failed: {e}")
+            logger.debug(traceback.format_exc())
+            retries += 1
+            continue  # Retry
+        except Exception as e:
+            logger.error(f"Failed to generate response with LLM: {e}")
+            logger.debug(traceback.format_exc())
+            retries += 1
+            continue  # Retry
+
+    # After retries, if still fails, return '/skip'
+    logger.error(f"Failed to generate response after {MAX_RETRIES} retries. Returning '/skip'")
+    return "/skip"
 
 # Function to handle automatic chat in background
 def auto_chat(selected_characters, session_id):
@@ -929,6 +958,10 @@ def auto_chat(selected_characters, session_id):
 
                 # Generate response from LLM
                 response = generate_response_with_llm("", history_fetched, "", current_character_data, MODEL_NAME)
+
+                if response == "/skip":
+                    logger.info(f"Skipping response for {current_character_name} due to '/skip'")
+                    continue  # Do not add to history or database
 
                 if not response:
                     response = "I'm sorry, I couldn't process your request."
