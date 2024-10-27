@@ -16,17 +16,18 @@ import queue
 import atexit
 import yaml
 from logging.handlers import RotatingFileHandler
+from typing import List
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "vanilj/midnight-miqu-70b-v1.5:latest"  # The model version
+MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # The model version
 CHARACTER_DIR = 'characters'  # Directory where character text files are stored
 LOG_FILE = 'app.log'  # Log file path
 # Configurable number of retries for LLM requests
 MAX_RETRIES = 3  # Set the desired number of retries
 
 # Summarization settings (configurable)
-MAX_CONTEXT_LENGTH = 100000  # Max context length before summarizing
+MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
 DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 20  # Configurable number of recent messages to keep in history after summarizing
 SUMMARY_PROMPT_TEMPLATE = (
     "Please provide a concise but comprehensive summary of the following conversation, "
@@ -120,6 +121,20 @@ def remove_trailing_pass(text):
     if text.endswith('/pass'):
         text = text[:-len('/pass')].rstrip()
     return text
+
+def remove_pass_lines(text):
+    """Remove any lines that start with '/pass' from the text."""
+    lines = text.strip().splitlines()
+    cleaned_lines = [line for line in lines if not line.strip().startswith('/pass')]
+    return '\n'.join(cleaned_lines).strip()
+
+def contains_pass(text):
+    """Check if any line in the text starts with '/pass'."""
+    lines = text.strip().splitlines()
+    for line in lines:
+        if line.strip().startswith('/pass'):
+            return True
+    return False
 
 # Function to remove timestamps from the character's response
 def remove_timestamps_from_response(response):
@@ -615,7 +630,17 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
     else:
         response = generate_response_with_llm(user_input, history, summary, character_data, MODEL_NAME)
         if not is_first_assistant_message(history):
-            adjusted_response = check_and_rewrite_response(response, character_name)
+            # Build known_characters set
+            known_characters = set()
+            for msg in history:
+                if 'name' in msg and msg['name']:
+                    known_characters.add(msg['name'])
+            if assistant_character:
+                known_characters.add(assistant_character)
+            # Convert to list
+            known_characters_list = list(known_characters)
+
+            adjusted_response = check_and_rewrite_response(response, character_name, known_characters_list)
             if adjusted_response != "/pass":
                 response = adjusted_response
 
@@ -974,7 +999,7 @@ def generate_response_with_llm(user_input: str, history: list, summary: str, cha
     logger.error(f"Failed to generate response after {MAX_RETRIES} retries. Returning '/skip'")
     return "/skip"
 
-def check_and_rewrite_response(response: str, character_name: str) -> str:
+def check_and_rewrite_response(response: str, character_name: str, known_characters: List[str]) -> str:
     """
     Check and possibly rewrite the response using the checking prompt template.
     Returns the adjusted response, or the original response if no adjustment is needed.
@@ -982,6 +1007,8 @@ def check_and_rewrite_response(response: str, character_name: str) -> str:
     # Return the response as-is if it is '/skip'
     if response.strip() == '/skip':
         return response
+
+    known_characters_list = ', '.join(known_characters)
 
     checking_prompt_template = """### Instruction ###
 You will receive a response intended to reflect a specific character's unique voice, actions, and feelings. Review the response to ensure it meets all requirements without introducing any new characters, changes in intended tone, or unnecessary markdown formatting. Do not include any reasoning or explanations in your output.
@@ -996,11 +1023,15 @@ You will receive a response intended to reflect a specific character's unique vo
    - Ensure the response focuses on this character’s perspective, avoiding direct dialogue or actions for other characters.
    - Verify that no new characters are introduced and that interactions remain within the established scene context.
 
-**Step 3: Ensure Proper Formatting**  
+**Step 3: Ensure Only Known Characters Are Referenced**
+   - Verify that the response only includes interactions with the following characters: {known_characters_list}.
+   - Ensure that there are no references to characters outside this list.
+
+**Step 4: Ensure Proper Formatting**  
    - Ensure no other markdown syntax (such as **bold** or # Headings) is present. Only *italic* formatting is allowed.
 
-**Step 4: Check Length of Response**  
-   - Ensure that the response is concise; limited to a small number of lines.
+**Step 5: Check Length of Response**  
+   - Ensure that the response is concise; limited to several lines.
 
 ---
 
@@ -1010,7 +1041,7 @@ You will receive a response intended to reflect a specific character's unique vo
    - Return only /pass to confirm that the response requires no adjustments.
 
 - **If any criteria are not met (Requires Adjustment):**  
-   - Make only the necessary modifications to align the response with the guidelines above, including making it more concise if it exceeds a small number of lines.
+   - Make only the necessary modifications to align the response with the guidelines above, including making it more concise if it exceeds several of lines.
    - Return only the adjusted response with no additional comments or explanations.
 
 ---
@@ -1020,7 +1051,7 @@ You will receive a response intended to reflect a specific character's unique vo
 """
 
     checking_prompt = checking_prompt_template.format(
-        character_name=character_name,
+        known_characters_list=known_characters_list,
         response_to_validate=response
     )
 
@@ -1045,7 +1076,7 @@ You will receive a response intended to reflect a specific character's unique vo
         return response  # Return original response as it passed the check
     else:
         # Remove trailing '/pass' and any trailing newlines
-        adjusted_response_cleaned = remove_trailing_pass(adjusted_response)
+        adjusted_response_cleaned = remove_pass_lines(remove_trailing_pass(adjusted_response))
         logger.debug(
             f"The original response did not pass the checks.\n"
             f"Original message: '{response}'\n"
@@ -1083,10 +1114,29 @@ def auto_chat(selected_characters, session_id):
                     history_fetched = add_name_to_history(history_fetched)
                     logger.debug(f"Auto_chat retrieved history: {history_fetched}")
 
+                    # Attempt to determine the assistant character from history
+                    assistant_character = None
+                    for msg in reversed(history_fetched):
+                        if msg['role'] == 'assistant':
+                            assistant_character = msg.get('name', None)
+                            break
+
                 # Generate response from LLM
                 response = generate_response_with_llm("", history_fetched, "", current_character_data, MODEL_NAME)
                 if not is_first_assistant_message(history_fetched):
-                    adjusted_response = check_and_rewrite_response(response, current_character_name)
+                    # Build known_characters set
+                    known_characters = set()
+                    for msg in history_fetched:
+                        if 'name' in msg and msg['name']:
+                            known_characters.add(msg['name'])
+                    if selected_characters:
+                        known_characters.update(selected_characters)
+                    if assistant_character:
+                        known_characters.add(assistant_character)
+                    # Convert to list
+                    known_characters_list = list(known_characters)
+
+                    adjusted_response = check_and_rewrite_response(response, current_character_name, known_characters_list)
                     if adjusted_response != "/pass":
                         response = adjusted_response
 
