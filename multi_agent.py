@@ -159,9 +159,9 @@ def clean_response(response):
     response = re.sub(r':::', '', response)
     return response.strip()
 
-# Function to ensure the 'characters' directory exists and add default characters
+# Function to ensure the 'characters' directory exists
 def ensure_character_directory():
-    """Ensure the 'characters' directory exists, create it if not."""
+    """Ensure the 'characters' directory exists, create it if not"""
     if not os.path.exists(CHARACTER_DIR):
         os.makedirs(CHARACTER_DIR)
         logger.info(f"Created '{CHARACTER_DIR}' directory.")
@@ -992,6 +992,7 @@ def check_and_rewrite_response(response: str, character_name: str, known_charact
     """
     Check and possibly rewrite the response using the checking prompt template.
     Returns the adjusted response, or the original response if no adjustment is needed.
+    Repeats the checking process until /pass is returned or MAX_RETRIES is reached.
     """
     # Return the response as-is if it is '/skip'
     if response.strip() == '/skip':
@@ -1017,10 +1018,16 @@ You will receive a response intended to reflect a specific character's unique vo
    - Ensure that there are no references to characters outside this list.
 
 **Step 4: Ensure Proper Formatting**  
-   - Ensure no other markdown syntax (such as **bold** or # Headings) is present. Only *italic* formatting is allowed.
+   - Ensure no other markdown syntax (such as ---, **bold**, or # Headings) is present. Only *italic* formatting is allowed.
 
 **Step 5: Check Length of Response**  
    - Ensure that the response is concise; limited to several lines.
+
+**Step 6: Check for Guidelines in the Response**
+   - Ensure that the response does not include any guidelines, instructions, or validation steps. It should only be the character's narrative or dialogue.
+
+**Step 7: Adjust Length for Overly Long Responses**
+   - If the original input is very long, focus on the start to maintain consistent information and broadly summarize or ignore the rest.
 
 ---
 
@@ -1030,7 +1037,7 @@ You will receive a response intended to reflect a specific character's unique vo
    - Return only /pass to confirm that the response requires no adjustments.
 
 - **If any criteria are not met (Requires Adjustment):**  
-   - Make only the necessary modifications to align the response with the guidelines above, including making it more concise if it exceeds several of lines.
+   - Make only the necessary modifications to align the response with the guidelines above, including making it more concise if it exceeds several lines.
    - Return only the adjusted response with no additional comments or explanations.
 
 ---
@@ -1039,39 +1046,47 @@ You will receive a response intended to reflect a specific character's unique vo
 {response_to_validate}
 """
 
-    checking_prompt = checking_prompt_template.format(
-        known_characters_list=known_characters_list,
-        response_to_validate=response
-    )
+    retries = 0
+    response_to_validate = response
 
-    # Call generate_response_with_llm with is_checking=True
-    adjusted_response = generate_response_with_llm(
-        user_input=checking_prompt,
-        history=[],
-        summary="",
-        character_data=None,
-        model=MODEL_NAME,
-        is_checking=True
-    )
+    while retries < MAX_RETRIES:
+        retries += 1
 
-    # Split the adjusted response into lines and strip whitespace
-    adjusted_response_lines = adjusted_response.strip().splitlines()
-
-    # Check if the first non-empty line is '/pass'
-    first_non_empty_line = next((line.strip() for line in adjusted_response_lines if line.strip()), "")
-
-    if first_non_empty_line == "/pass":
-        logger.debug(f"The original response passed the checks. Original message: '{response}'")
-        return response  # Return original response as it passed the check
-    else:
-        # Remove trailing '/pass' and any trailing newlines
-        adjusted_response_cleaned = remove_pass_lines(remove_trailing_pass(adjusted_response))
-        logger.debug(
-            f"The original response did not pass the checks.\n"
-            f"Original message: '{response}'\n"
-            f"Adjusted response: '{adjusted_response_cleaned}'"
+        checking_prompt = checking_prompt_template.format(
+            known_characters_list=known_characters_list,
+            response_to_validate=response_to_validate
         )
-        return adjusted_response_cleaned
+
+        # Call generate_response_with_llm with is_checking=True
+        adjusted_response = generate_response_with_llm(
+            user_input=checking_prompt,
+            history=[],
+            summary="",
+            character_data=None,
+            model=MODEL_NAME,
+            is_checking=True
+        )
+
+        # Split the adjusted response into lines and strip whitespace
+        adjusted_response_lines = adjusted_response.strip().splitlines()
+
+        # Check if the first non-empty line is '/pass'
+        first_non_empty_line = next((line.strip() for line in adjusted_response_lines if line.strip()), "")
+
+        if first_non_empty_line == "/pass":
+            logger.debug(f"The response passed the checks. Message: '{response_to_validate}'")
+            return response_to_validate  # Return the response as it passed the check
+        else:
+            # Remove trailing '/pass' and any trailing newlines
+            adjusted_response_cleaned = remove_pass_lines(remove_trailing_pass(adjusted_response))
+            logger.debug(
+                f"Attempt {retries}: The response did not pass the checks.\n"
+                f"Adjusted response: '{adjusted_response_cleaned}'"
+            )
+            response_to_validate = adjusted_response_cleaned  # Prepare for next iteration
+
+    logger.debug(f"Maximum retries reached. Returning last adjusted response.")
+    return response_to_validate
     
 # Function to handle automatic chat in background
 def auto_chat(selected_characters, session_id):
