@@ -161,21 +161,10 @@ def clean_response(response):
 
 # Function to ensure the 'characters' directory exists and add default characters
 def ensure_character_directory():
-    """Ensure the 'characters' directory exists, create it if not, and add default characters."""
+    """Ensure the 'characters' directory exists, create it if not."""
     if not os.path.exists(CHARACTER_DIR):
         os.makedirs(CHARACTER_DIR)
         logger.info(f"Created '{CHARACTER_DIR}' directory.")
-        # Add default character files if necessary
-        default_characters = {
-            'Lily.txt': "You are Lily, a friendly and energetic individual who loves to engage in deep conversations about personal growth and happiness. Your presence is uplifting, and you always aim to bring positivity to every interaction.",
-            'Niko.txt': "You are Niko, a thoughtful and introspective person with a passion for technology and innovation. You enjoy discussing complex topics and providing insightful perspectives on various subjects.",
-            'Serena.txt': "You are Serena, a calm and composed mentor with expertise in emotional intelligence and mindfulness. You guide others with patience and wisdom, helping them navigate through their challenges with grace."
-        }
-        for filename, content in default_characters.items():
-            file_path = os.path.join(CHARACTER_DIR, filename)
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            logger.info(f"Added default character file: {file_path}")
 
 # Function to retrieve character files
 def get_character_files():
