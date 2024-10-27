@@ -113,6 +113,14 @@ def generate_cache_key(user_prompt: str, history: list, summary: str, system_pro
     cache_key = hashlib.sha256(key_components.encode('utf-8')).hexdigest()
     return cache_key
 
+def remove_trailing_pass(text):
+    """Remove trailing '/pass' and any trailing empty lines from the text."""
+    text = text.rstrip()
+    # Remove '/pass' at the end
+    if text.endswith('/pass'):
+        text = text[:-len('/pass')].rstrip()
+    return text
+
 # Function to remove timestamps from the character's response
 def remove_timestamps_from_response(response):
     """Remove timestamps at the beginning of the response."""
@@ -1036,13 +1044,15 @@ You will receive a response intended to reflect a specific character's unique vo
         logger.debug(f"The original response passed the checks. Original message: '{response}'")
         return response  # Return original response as it passed the check
     else:
+        # Remove trailing '/pass' and any trailing newlines
+        adjusted_response_cleaned = remove_trailing_pass(adjusted_response)
         logger.debug(
             f"The original response did not pass the checks.\n"
             f"Original message: '{response}'\n"
-            f"Adjusted response: '{adjusted_response}'"
+            f"Adjusted response: '{adjusted_response_cleaned}'"
         )
-        return adjusted_response.strip()
-
+        return adjusted_response_cleaned
+    
 # Function to handle automatic chat in background
 def auto_chat(selected_characters, session_id):
     """Background thread function to handle automatic chatting."""
