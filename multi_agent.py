@@ -15,17 +15,18 @@ import time
 import queue
 import atexit
 import yaml
+from logging.handlers import RotatingFileHandler
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # The model version
+MODEL_NAME = "vanilj/midnight-miqu-70b-v1.5:latest"  # The model version
 CHARACTER_DIR = 'characters'  # Directory where character text files are stored
 LOG_FILE = 'app.log'  # Log file path
 # Configurable number of retries for LLM requests
 MAX_RETRIES = 3  # Set the desired number of retries
 
 # Summarization settings (configurable)
-MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
+MAX_CONTEXT_LENGTH = 100000  # Max context length before summarizing
 DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 20  # Configurable number of recent messages to keep in history after summarizing
 SUMMARY_PROMPT_TEMPLATE = (
     "Please provide a concise but comprehensive summary of the following conversation, "
@@ -35,30 +36,48 @@ SUMMARY_PROMPT_TEMPLATE = (
 # Initialize a lock for session data to prevent race conditions
 session_lock = threading.Lock()
 
-# Initialize logging
-logger = logging.getLogger(__name__)
+# Clear root logger's handlers to avoid duplicate logs
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# Set up the root logger to handle warnings and above for other libraries
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.WARNING)
+
+# Set up your application logger
+logger = logging.getLogger('my_app')
 logger.setLevel(logging.DEBUG)
 
-# Create handlers
+# Clear any existing handlers to prevent duplicates
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+# File handler for your app's log file
+file_handler = RotatingFileHandler(LOG_FILE, mode='w', maxBytes=10**8, backupCount=0)
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Console handler for debugging output
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.DEBUG)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
-file_handler = logging.FileHandler(LOG_FILE)
-file_handler.setLevel(logging.DEBUG)
-
-# Create formatter and add it to handlers
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-console_handler.setFormatter(formatter)
-file_handler.setFormatter(formatter)
-
-# Add handlers to the logger
-logger.addHandler(console_handler)
+# Add handlers to your app's logger
 logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # Global cache variables
 cache = None
 cache_lock = threading.RLock()  # Use RLock for reentrant locking
+
+# Add this utility function to remove '/skip' tokens
+def remove_skip_tokens(text):
+    """Remove '/skip' tokens from the text."""
+    return re.sub(r'/skip\s*$', '', text).strip()
+
+def is_first_assistant_message(history):
+    assistant_messages = [msg for msg in history if msg['role'] == 'assistant']
+    return len(assistant_messages) == 0
 
 # Initialize cache using shelve
 def init_cache():
@@ -587,6 +606,10 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
         response = "I'm sorry, I couldn't find the character data."
     else:
         response = generate_response_with_llm(user_input, history, summary, character_data, MODEL_NAME)
+        if not is_first_assistant_message(history):
+            adjusted_response = check_and_rewrite_response(response, character_name)
+            if adjusted_response != "/pass":
+                response = adjusted_response
 
     if response == "/skip":
         logger.info("LLM response was '/skip'. Not adding assistant message to history.")
@@ -609,6 +632,7 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
         response = remove_timestamps_from_response(response)
         response = remove_leading_name_from_response(response, character_name)
         response = clean_response(response)  # Clean unwanted markdown code fences
+        response = remove_skip_tokens(response)
         logger.debug(f"Processed LLM response: {response}")
 
     # Get current timestamp
@@ -789,7 +813,7 @@ def summarize_history(history, summary, system_prompt, model, session_id, num_re
     return summary.strip()
 
 # Function to generate a response from the LLM
-def generate_response_with_llm(user_input: str, history: list, summary: str, character_data: dict, model: str) -> str:
+def generate_response_with_llm(user_input: str, history: list, summary: str, character_data: dict, model: str, is_checking=False) -> str:
     """
     Generate a response from the LLM based on the character-specific templates and conversation context.
     Implements retry mechanism and returns '/skip' if the LLM fails after retries.
@@ -797,56 +821,72 @@ def generate_response_with_llm(user_input: str, history: list, summary: str, cha
     logger.debug(f"Entered generate_response_with_llm with prompt size {len(user_input)}")
     global cache
 
-    character_name = character_data.get('name', 'Assistant')
-
-    # Build the system prompt
-    system_prompt = character_data['conversation']['system_prompt']
-
-    # Determine if there is valid conversation history to include
-    has_history = any(msg['role'] in ['user', 'assistant'] for msg in history)
-
-    if has_history:
-        # Build the conversation history string from the messages
-        conversation_history = ""
-        for message in history:
-            if message['role'] in ['user', 'assistant']:
-                timestamp = message.get('timestamp', '')
-                name = message.get('name', 'Unknown')
-                content = message.get('content', '')
-                conversation_history += f"[{timestamp}] {name}: {content}\n"
-
-        # Use the character-specific user prompt template
-        user_prompt_template = character_data['conversation'].get('user_prompt_template_regular', '')
-        # Fill in the placeholders
-        full_user_prompt = user_prompt_template.format(
-            conversation_history=conversation_history,
-            character_name=character_name
-        )
+    if is_checking:
+        logger.debug(f"Checking prompt with size {len(user_input)}")
+        # For checking prompts, we use a default system prompt
+        system_prompt = "You are an assistant who helps to check and adjust responses according to guidelines."
+        # Prepare the system and user messages for the LLM
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ]
     else:
-        # Use the character-specific start prompt template
-        user_prompt_template_start = character_data['conversation'].get('user_prompt_template_start', '')
-        full_user_prompt = user_prompt_template_start.format(
-            character_name=character_name
-        )
+        if not character_data:
+            logger.error("Character data is required when not checking.")
+            return "I'm sorry, I couldn't find the character data."
 
-    # Generate a unique cache key based on the current state
-    cache_key = generate_cache_key(full_user_prompt, history, summary, system_prompt, model)
-    logger.debug(f"Generated cache key: {cache_key}")
+        character_name = character_data.get('name', 'Assistant')
 
-    # Attempt to fetch from cache
-    with cache_lock:
-        if cache and cache_key in cache:
-            logger.info(f"Fetching result from cache for prompt: {full_user_prompt[:50]}...")
-            response_content = cache[cache_key]
-            logger.debug(f"Cached response: {response_content}")
-            return response_content
+        # Build the system prompt
+        system_prompt = character_data['conversation']['system_prompt']
 
-    # Prepare the system and user messages for the LLM
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": full_user_prompt}
-    ]
+        # Determine if there is valid conversation history to include
+        has_history = any(msg['role'] in ['user', 'assistant'] for msg in history)
 
+        if has_history:
+            # Build the conversation history string from the messages
+            conversation_history = ""
+            for message in history:
+                if message['role'] in ['user', 'assistant']:
+                    timestamp = message.get('timestamp', '')
+                    name = message.get('name', 'Unknown')
+                    content = message.get('content', '')
+                    content = remove_skip_tokens(content)
+                    conversation_history += f"[{timestamp}] {name}: {content}\n"
+
+            # Use the character-specific user prompt template
+            user_prompt_template = character_data['conversation'].get('user_prompt_template_regular', '')
+            # Fill in the placeholders
+            full_user_prompt = user_prompt_template.format(
+                conversation_history=conversation_history,
+                character_name=character_name
+            )
+        else:
+            # Use the character-specific start prompt template
+            user_prompt_template_start = character_data['conversation'].get('user_prompt_template_start', '')
+            full_user_prompt = user_prompt_template_start.format(
+                character_name=character_name
+            )
+
+        # Generate a unique cache key based on the current state
+        cache_key = generate_cache_key(full_user_prompt, history, summary, system_prompt, model)
+        logger.debug(f"Generated cache key: {cache_key}")
+
+        # Attempt to fetch from cache
+        with cache_lock:
+            if cache and cache_key in cache:
+                logger.info(f"Fetching result from cache for prompt: {full_user_prompt[:50]}...")
+                response_content = cache[cache_key]
+                logger.debug(f"Cached response: {response_content}")
+                return response_content
+
+        # Prepare the system and user messages for the LLM
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": full_user_prompt}
+        ]
+
+    # Prepare the payload
     payload = {
         "model": model,
         "messages": messages
@@ -897,8 +937,8 @@ def generate_response_with_llm(user_input: str, history: list, summary: str, cha
                 retries += 1
                 continue  # Retry
 
-            # Cache the result if caching is enabled
-            if cache:
+            # Cache the result if caching is enabled and not a checking prompt
+            if cache and not is_checking:
                 with cache_lock:
                     logger.debug("Caching the generated response.")
                     cache[cache_key] = response_content
@@ -925,6 +965,83 @@ def generate_response_with_llm(user_input: str, history: list, summary: str, cha
     # After retries, if still fails, return '/skip'
     logger.error(f"Failed to generate response after {MAX_RETRIES} retries. Returning '/skip'")
     return "/skip"
+
+def check_and_rewrite_response(response: str, character_name: str) -> str:
+    """
+    Check and possibly rewrite the response using the checking prompt template.
+    Returns the adjusted response, or the original response if no adjustment is needed.
+    """
+    # Return the response as-is if it is '/skip'
+    if response.strip() == '/skip':
+        return response
+
+    checking_prompt_template = """### Instruction ###
+You will receive a response intended to reflect a specific character's unique voice, actions, and feelings. Review the response to ensure it meets all requirements without introducing any new characters, changes in intended tone, or unnecessary markdown formatting. Do not include any reasoning or explanations in your output.
+
+### Validation Steps ###
+
+**Step 1: Verify Tone, Actions, and Emotional Consistency**  
+   - Confirm that the response is expressive and consistent in tone, with actions and feelings that are plausible for the character.
+   - Check that the response demonstrates a consistent tone and emotional depth, without unnecessary changes or embellishments to its expressive elements.
+
+**Step 2: Check for Character Perspective and Interactions**  
+   - Ensure the response focuses on this character’s perspective, avoiding direct dialogue or actions for other characters.
+   - Verify that no new characters are introduced and that interactions remain within the established scene context.
+
+**Step 3: Ensure Proper Formatting**  
+   - Ensure no other markdown syntax (such as **bold** or # Headings) is present. Only *italic* formatting is allowed.
+
+**Step 4: Check Length of Response**  
+   - Ensure that the response is concise; limited to a small number of lines.
+
+---
+
+### Outcome ###
+
+- **If all validation criteria are met (Approval):**  
+   - Return only /pass to confirm that the response requires no adjustments.
+
+- **If any criteria are not met (Requires Adjustment):**  
+   - Make only the necessary modifications to align the response with the guidelines above, including making it more concise if it exceeds a small number of lines.
+   - Return only the adjusted response with no additional comments or explanations.
+
+---
+
+### Response for Validation ###
+{response_to_validate}
+"""
+
+    checking_prompt = checking_prompt_template.format(
+        character_name=character_name,
+        response_to_validate=response
+    )
+
+    # Call generate_response_with_llm with is_checking=True
+    adjusted_response = generate_response_with_llm(
+        user_input=checking_prompt,
+        history=[],
+        summary="",
+        character_data=None,
+        model=MODEL_NAME,
+        is_checking=True
+    )
+
+    # Split the adjusted response into lines and strip whitespace
+    adjusted_response_lines = adjusted_response.strip().splitlines()
+
+    # Check if the first non-empty line is '/pass'
+    first_non_empty_line = next((line.strip() for line in adjusted_response_lines if line.strip()), "")
+
+    if first_non_empty_line == "/pass":
+        logger.debug(f"The original response passed the checks. Original message: '{response}'")
+        return response  # Return original response as it passed the check
+    else:
+        logger.debug(
+            f"The original response did not pass the checks.\n"
+            f"Original message: '{response}'\n"
+            f"Adjusted response: '{adjusted_response}'"
+        )
+        return adjusted_response.strip()
 
 # Function to handle automatic chat in background
 def auto_chat(selected_characters, session_id):
@@ -958,6 +1075,10 @@ def auto_chat(selected_characters, session_id):
 
                 # Generate response from LLM
                 response = generate_response_with_llm("", history_fetched, "", current_character_data, MODEL_NAME)
+                if not is_first_assistant_message(history_fetched):
+                    adjusted_response = check_and_rewrite_response(response, current_character_name)
+                    if adjusted_response != "/pass":
+                        response = adjusted_response
 
                 if response == "/skip":
                     logger.info(f"Skipping response for {current_character_name} due to '/skip'")
@@ -970,6 +1091,7 @@ def auto_chat(selected_characters, session_id):
                     response = remove_timestamps_from_response(response)
                     response = remove_leading_name_from_response(response, current_character_name)
                     response = clean_response(response)
+                    response = remove_skip_tokens(response)
                     logger.debug(f"Processed LLM response for {current_character_name}: {response}")
 
                 # Get current timestamp
