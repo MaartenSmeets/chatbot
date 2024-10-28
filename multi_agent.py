@@ -27,8 +27,10 @@ LOG_FILE = 'app.log'  # Log file path
 MAX_RETRIES = 3  # Set the desired number of retries
 
 # Summarization settings (configurable)
-MAX_CONTEXT_LENGTH = 400000  # Max context length before summarizing
+MAX_CONTEXT_LENGTH = 100000  # Max context length before summarizing
 DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 20  # Configurable number of recent messages to keep in history after summarizing
+# Number of history lines to consider in response validation (configurable)
+DEFAULT_NUMBER_OF_HISTORY_LINES_FOR_VALIDATION = 5
 SUMMARY_PROMPT_TEMPLATE = (
     "Please provide a concise but comprehensive summary of the following conversation, "
     "including all important details, timestamps, and topics discussed:\n{conversation}\nSummary:"
@@ -629,7 +631,16 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
             # Convert to list
             known_characters_list = list(known_characters)
 
-            adjusted_response = check_and_rewrite_response(response, character_name, known_characters_list)
+            # Get character description
+            character_description = character_data.get('description', '')
+
+            adjusted_response = check_and_rewrite_response(
+                response,
+                character_name,
+                character_description,
+                known_characters_list,
+                history
+            )
             if adjusted_response != "/pass":
                 response = adjusted_response
 
@@ -696,7 +707,7 @@ def respond(user_input, history, summary, session_id, assistant_character, user_
         gr.update(value=character_info),         # character_info_display
         assistant_character                      # assistant_character state
     )
-
+    
 # Function to start auto chat
 def start_auto_chat(selected_characters, session_id):
     """Start the auto chat thread."""
@@ -835,7 +846,7 @@ def summarize_history(history, summary, system_prompt, model, session_id, num_re
     return summary.strip()
 
 # Function to generate a response from the LLM
-def generate_response_with_llm(user_input: str, history: list, summary: str, character_data: dict, model: str, is_checking=False) -> str:
+def generate_response_with_llm(user_input: str, history: list, summary: str, character_data: dict, model: str, is_checking=False, character_description=None) -> str:
     """
     Generate a response from the LLM based on the character-specific templates and conversation context.
     Implements retry mechanism and returns '/skip' if the LLM fails after retries.
@@ -845,8 +856,12 @@ def generate_response_with_llm(user_input: str, history: list, summary: str, cha
 
     if is_checking:
         logger.debug(f"Checking prompt with size {len(user_input)}")
-        # For checking prompts, we use a default system prompt
-        system_prompt = "You are an assistant who helps to check and adjust responses according to guidelines."
+        # For checking prompts, include character description in the system prompt
+        if character_description:
+            system_prompt = f"You are an assistant who helps to check and adjust responses according to guidelines. Use the following character description to ensure the response is in character:\n\n{character_description}"
+        else:
+            system_prompt = "You are an assistant who helps to check and adjust responses according to guidelines."
+
         # Prepare the system and user messages for the LLM
         messages = [
             {"role": "system", "content": system_prompt},
@@ -987,10 +1002,10 @@ def generate_response_with_llm(user_input: str, history: list, summary: str, cha
     # After retries, if still fails, return '/skip'
     logger.error(f"Failed to generate response after {MAX_RETRIES} retries. Returning '/skip'")
     return "/skip"
-
-def check_and_rewrite_response(response: str, character_name: str, known_characters: List[str]) -> str:
+    
+def check_and_rewrite_response(response: str, character_name: str, character_description: str, known_characters: List[str], history: List[dict], num_history_lines: int = DEFAULT_NUMBER_OF_HISTORY_LINES_FOR_VALIDATION) -> str:
     """
-    Check and possibly rewrite the response using the checking prompt template.
+    Check and possibly rewrite the response using separate validation and correction prompts.
     Returns the adjusted response, or the original response if no adjustment is needed.
     Repeats the checking process until /pass is returned or MAX_RETRIES is reached.
     """
@@ -1000,50 +1015,79 @@ def check_and_rewrite_response(response: str, character_name: str, known_charact
 
     known_characters_list = ', '.join(known_characters)
 
-    checking_prompt_template = """### Instruction ###
-You will receive a response intended to reflect a specific character's unique voice, actions, and feelings. Review the response to ensure it meets all requirements without introducing any new characters, changes in intended tone, or unnecessary markdown formatting. Do not include any reasoning or explanations in your output.
+    # Extract the last N lines of history
+    recent_history = history[-num_history_lines:] if len(history) >= num_history_lines else history[:]
 
-### Validation Steps ###
+    # Prepare the conversation history string
+    conversation_history = ""
+    for message in recent_history:
+        if message['role'] in ['user', 'assistant']:
+            timestamp = message.get('timestamp', '')
+            name = message.get('name', 'Unknown')
+            content = message.get('content', '')
+            content = remove_skip_tokens(content)
+            conversation_history += f"[{timestamp}] {name}: {content}\n"
 
-**Step 1: Verify Tone, Actions, and Emotional Consistency**  
-   - Confirm that the response is expressive and consistent in tone, with actions and feelings that are plausible for the character.
-   - Check that the response demonstrates a consistent tone and emotional depth, without unnecessary changes or embellishments to its expressive elements.
+    # Validation prompt template
+    validation_prompt_template = """### Instructions ###
+Validate the response based on the following guidelines, the character description, and the recent conversation history. Clearly indicate only /pass if it passes, or provide a concise explanation of what needs to be changed for it to pass. When in doubt, consider the requirements met and return only /pass.
 
-**Step 2: Check for Character Perspective and Interactions**  
-   - Ensure the response focuses on this character’s perspective, avoiding direct dialogue or actions for other characters.
-   - Verify that no new characters are introduced and that interactions remain within the established scene context.
+### Character Description ###
+{character_description}
 
-**Step 3: Ensure Only Known Characters Are Referenced**
-   - Verify that the response only includes interactions with the following characters: {known_characters_list}.
-   - Ensure that there are no references to characters outside this list.
+### Recent Conversation History ###
+{conversation_history}
 
-**Step 4: Ensure Proper Formatting**  
-   - Ensure no other markdown syntax (such as ---, **bold**, or # Headings) is present. Only *italic* formatting is allowed.
+### Guidelines ###
 
-**Step 5: Check Length of Response**  
-   - Ensure that the response is concise; limited to several lines.
+1. **Content and Guideline Verification**
+   - Ensure the response does not include out of character guidelines, instructions, evaluations, or rule reminders.
 
-**Step 6: Check for Guidelines in the Response**
-   - Ensure that the response does not include any guidelines, instructions, or validation steps. It should only be the character's narrative or dialogue.
+2. **Character Focus**
+   - Confirm that the response is written from {character_name}'s perspective (e.g. "{character_name} felt...", "{character_name} noticed...") or using first-person narration (e.g., "I felt...", "I saw..."). The response should contain one or more of the following: actions, dialogue, feelings, observations, intentions, thoughts and emotions. When in doubt, consider the guideline met.
 
-**Step 7: Adjust Length for Overly Long Responses**
-   - If the original input is very long, focus on the start to maintain consistent information and broadly summarize or ignore the rest.
+3. **Character Consistency**
+   - Ensure only interactions with {known_characters_list} appear, with no references to characters outside this list.
+
+4. **Formatting**
+   - Only *italic* formatting is allowed (irrespective of usage), with no other markdown elements such as horizontal lines (---, ___, or ***), **bold text**, or # headers.
+
+5. **Response Length**
+   - Check that the response is concise, limited to a few lines.
+
+6. **Factual Consistency**
+   - Verify that the response is factually consistent with the events described in the recent conversation history, especially with respect to actions performed by characters. Ensure that actions performed by multiple characters are not confused or misattributed.
+
+7. **Engagement and Continuity**
+   - Ensure the response advances the story or conversation.
+---
+
+### Response to Validate ###
+{response_to_validate}
 
 ---
 
 ### Outcome ###
 
-- **If all validation criteria are met (Approval):**  
-   - Return only /pass to confirm that the response requires no adjustments.
+- **If all criteria are met:** Return only /pass. Do not provide explanation or feedback. When in doubt, return only /pass
+- **If unmet criteria exist:** Provide only a concise explanation of required changes for compliance without referencing specific guidelines. Do not repeat the guidelines or mention passed validations. Do not supply the corrected response or a sample of a response that would pass, only instructions/feedback.
+"""
 
-- **If any criteria are not met (Requires Adjustment):**  
-   - Make only the necessary modifications to align the response with the guidelines above, including making it more concise if it exceeds several lines.
-   - Return only the adjusted response with no additional comments or explanations.
+    # Correction prompt template
+    correction_prompt_template = """### Instructions ###
+Based on the feedback provided, adjust the original response. Provide only the corrected response without reasoning or explanations. Do not include any feedback or guidelines in the response.
 
 ---
 
-### Response for Validation ###
-{response_to_validate}
+### Original Response ###
+{original_response}
+
+### Feedback ###
+{feedback}
+
+---
+
+### Corrected Response ###
 """
 
     retries = 0
@@ -1052,35 +1096,54 @@ You will receive a response intended to reflect a specific character's unique vo
     while retries < MAX_RETRIES:
         retries += 1
 
-        checking_prompt = checking_prompt_template.format(
+        # Prepare the validation prompt
+        validation_prompt = validation_prompt_template.format(
+            character_description=character_description,
+            character_name=character_name,
             known_characters_list=known_characters_list,
+            conversation_history=conversation_history,
             response_to_validate=response_to_validate
         )
 
-        # Call generate_response_with_llm with is_checking=True
-        adjusted_response = generate_response_with_llm(
-            user_input=checking_prompt,
+        # Call the LLM for validation
+        validation_result = generate_response_with_llm(
+            user_input=validation_prompt,
             history=[],
             summary="",
             character_data=None,
             model=MODEL_NAME,
-            is_checking=True
+            is_checking=True,
+            character_description=character_description
         )
 
-        # Split the adjusted response into lines and strip whitespace
-        adjusted_response_lines = adjusted_response.strip().splitlines()
-
-        # Check if the first non-empty line is '/pass'
-        first_non_empty_line = next((line.strip() for line in adjusted_response_lines if line.strip()), "")
-
-        if first_non_empty_line == "/pass":
+        # Process the validation result
+        validation_result = validation_result.strip()
+        if validation_result == "/pass":
             logger.debug(f"The response passed the checks. Message: '{response_to_validate}'")
             return response_to_validate  # Return the response as it passed the check
         else:
-            # Remove trailing '/pass' and any trailing newlines
-            adjusted_response_cleaned = remove_pass_lines(remove_trailing_pass(adjusted_response))
+            # Prepare the correction prompt
+            correction_prompt = correction_prompt_template.format(
+                original_response=response_to_validate,
+                feedback=validation_result
+            )
+
+            # Call the LLM for correction
+            adjusted_response = generate_response_with_llm(
+                user_input=correction_prompt,
+                history=[],
+                summary="",
+                character_data=None,
+                model=MODEL_NAME,
+                is_checking=True,
+                character_description=character_description
+            )
+
+            # Prepare for next iteration
+            adjusted_response_cleaned = adjusted_response.strip()
             logger.debug(
                 f"Attempt {retries}: The response did not pass the checks.\n"
+                f"Feedback: '{validation_result}'\n"
                 f"Adjusted response: '{adjusted_response_cleaned}'"
             )
             response_to_validate = adjusted_response_cleaned  # Prepare for next iteration
@@ -1112,6 +1175,11 @@ def auto_chat(selected_characters, session_id):
                     continue
                 logger.debug(f"Current character for auto chat: {current_character_name}")
 
+                # Retrieve the character description
+                character_description = current_character_data.get('description', '')
+                if not character_description:
+                    logger.warning(f"Character description for '{current_character_name}' is empty.")
+
                 # Acquire the lock to safely access the history
                 with session_lock:
                     history_fetched = retrieve_messages(session_id)
@@ -1126,7 +1194,13 @@ def auto_chat(selected_characters, session_id):
                             break
 
                 # Generate response from LLM
-                response = generate_response_with_llm("", history_fetched, "", current_character_data, MODEL_NAME)
+                response = generate_response_with_llm(
+                    user_input="",
+                    history=history_fetched,
+                    summary="",
+                    character_data=current_character_data,
+                    model=MODEL_NAME
+                )
                 if not is_first_assistant_message(history_fetched):
                     # Build known_characters set
                     known_characters = set()
@@ -1140,7 +1214,13 @@ def auto_chat(selected_characters, session_id):
                     # Convert to list
                     known_characters_list = list(known_characters)
 
-                    adjusted_response = check_and_rewrite_response(response, current_character_name, known_characters_list)
+                    adjusted_response = check_and_rewrite_response(
+                        response=response,
+                        character_name=current_character_name,
+                        character_description=character_description,
+                        known_characters=known_characters_list,
+                        history=history_fetched
+                    )
                     if adjusted_response != "/pass":
                         response = adjusted_response
 
@@ -1181,7 +1261,7 @@ def auto_chat(selected_characters, session_id):
         logger.error(f"Exception in auto_chat thread: {e}")
         logger.debug(traceback.format_exc())
         auto_mode_active = False  # Ensure the flag is reset on exception
-
+        
 script_js = """
     <script>
     document.addEventListener('keydown', function(event) {
