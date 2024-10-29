@@ -27,10 +27,10 @@ LOG_FILE = 'app.log'  # Log file path
 MAX_RETRIES = 3  # Set the desired number of retries
 
 # Summarization settings (configurable)
-MAX_CONTEXT_LENGTH = 100000  # Max context length before summarizing
+MAX_CONTEXT_LENGTH = 32000  # Max context length before summarizing
 DEFAULT_NUMBER_OF_RECENT_MESSAGES_TO_KEEP = 20  # Configurable number of recent messages to keep in history after summarizing
 # Number of history lines to consider in response validation (configurable)
-DEFAULT_NUMBER_OF_HISTORY_LINES_FOR_VALIDATION = 5
+DEFAULT_NUMBER_OF_HISTORY_LINES_FOR_VALIDATION = 3
 SUMMARY_PROMPT_TEMPLATE = (
     "Please provide a concise but comprehensive summary of the following conversation, "
     "including all important details, timestamps, and topics discussed:\n{conversation}\nSummary:"
@@ -1030,7 +1030,7 @@ def check_and_rewrite_response(response: str, character_name: str, character_des
 
     # Validation prompt template
     validation_prompt_template = """### Instructions ###
-Validate the response based on the following guidelines, the character description, and the recent conversation history. Clearly indicate only /pass if it passes, or provide a concise explanation of what needs to be changed for it to pass. When in doubt, consider the requirements met and return only /pass.
+Validate the response based on the following guidelines, the character description, and the recent conversation history. Clearly indicate only /pass if it passes, or provide a concise explanation of what needs to be changed for it to pass.
 
 ### Character Description ###
 {character_description}
@@ -1044,16 +1044,16 @@ Validate the response based on the following guidelines, the character descripti
    - Ensure the response does not include out of character guidelines, instructions, evaluations, or rule reminders.
 
 2. **Character Focus**
-   - Confirm that the response is written from {character_name}'s perspective (e.g. "{character_name} felt...", "{character_name} noticed...") or using first-person narration (e.g., "I felt...", "I saw..."). The response should contain one or more of the following: actions, dialogue, feelings, observations, intentions, thoughts and emotions. When in doubt, consider the guideline met.
+   - Confirm that the response is written from {character_name}'s perspective (e.g. "{character_name} felt...", "{character_name} noticed...") or using first-person narration (e.g., "I felt...", "I saw..."). The response should contain one or more of the following: actions, dialogue, feelings, observations, intentions, thoughts and emotions.
 
 3. **Character Consistency**
    - Ensure only interactions with {known_characters_list} appear, with no references to characters outside this list.
 
 4. **Formatting**
-   - Only *italic* formatting is allowed (irrespective of usage), with no other markdown elements such as horizontal lines (---, ___, or ***), **bold text**, or # headers.
+   - Only *italic* formatting is allowed (irrespective of usage). No other markdown elements such as horizontal lines (---, ___, or ***), **bold text**, or # headers are allowed.
 
 5. **Response Length**
-   - Check that the response is concise, limited to a few lines.
+   - Check that the response is no more than a small number of lines. Ensure lines do not start with a datetime and/or "{character_name}:" as this is provided by the system.
 
 6. **Factual Consistency**
    - Verify that the response is factually consistent with the events described in the recent conversation history, especially with respect to actions performed by characters. Ensure that actions performed by multiple characters are not confused or misattributed.
@@ -1069,13 +1069,13 @@ Validate the response based on the following guidelines, the character descripti
 
 ### Outcome ###
 
-- **If all criteria are met:** Return only /pass. Do not provide explanation or feedback. When in doubt, return only /pass
-- **If unmet criteria exist:** Provide only a concise explanation of required changes for compliance without referencing specific guidelines. Do not repeat the guidelines or mention passed validations. Do not supply the corrected response or a sample of a response that would pass, only instructions/feedback.
+- **If all guidelines are met or when deviations are minimal:** Return only /pass and nothing else. Do not provide explanation or feedback. When in doubt, return only /pass and nothing else.
+- **If unmet guidelines exist and required changes are significant:** Provide only a concise explanation of required changes for compliance to only the guidelines which are not met, without specifically referencing them. Do not repeat the guidelines or mention passed validations. Do not provide suggestions for improvements outside of the scope of the guidelines. Do not introduce new criteria not explicitely mentioned before.
 """
 
     # Correction prompt template
     correction_prompt_template = """### Instructions ###
-Based on the feedback provided, adjust the original response. Provide only the corrected response without reasoning or explanations. Do not include any feedback or guidelines in the response.
+Based on the feedback provided, adjust the original response. Provide only the corrected response without reasoning or explanations. Do not include any feedback or guidelines in the response. If the response is too long, focus on the start of the response and ignore the rest.
 
 ---
 
@@ -1111,7 +1111,7 @@ Based on the feedback provided, adjust the original response. Provide only the c
             history=[],
             summary="",
             character_data=None,
-            model=MODEL_NAME,
+            model=CHECK_MODEL_NAME,
             is_checking=True,
             character_description=character_description
         )
@@ -1134,7 +1134,7 @@ Based on the feedback provided, adjust the original response. Provide only the c
                 history=[],
                 summary="",
                 character_data=None,
-                model=MODEL_NAME,
+                model=CHECK_MODEL_NAME,
                 is_checking=True,
                 character_description=character_description
             )
@@ -1176,9 +1176,10 @@ def auto_chat(selected_characters, session_id):
                 logger.debug(f"Current character for auto chat: {current_character_name}")
 
                 # Retrieve the character description
-                character_description = current_character_data.get('description', '')
+                character_description = current_character_data['conversation']['system_prompt']
                 if not character_description:
                     logger.warning(f"Character description for '{current_character_name}' is empty.")
+                    logger.warning(f"Using current_character_data: {current_character_data}")
 
                 # Acquire the lock to safely access the history
                 with session_lock:
