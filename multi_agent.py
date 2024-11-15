@@ -20,11 +20,12 @@ from typing import List
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"  # The model version
+MODEL_NAME = "tsiannian/magnum-72b-v1.q_k_m" #"finalend/l3-70b-euryale" #"vanilj/midnight-miqu-70b-v1.5:latest"  # The model version
+CHECK_MODEL_NAME = "tsiannian/magnum-72b-v1.q_k_m" #"jean-luc/big-tiger-gemma:27b-v1c-Q3_K_M"  # The model version
 CHARACTER_DIR = 'characters'  # Directory where character text files are stored
 LOG_FILE = 'app.log'  # Log file path
 # Configurable number of retries for LLM requests
-MAX_RETRIES = 3  # Set the desired number of retries
+MAX_RETRIES = 5  # Set the desired number of retries
 
 # Summarization settings (configurable)
 MAX_CONTEXT_LENGTH = 32000  # Max context length before summarizing
@@ -1040,27 +1041,34 @@ Validate the response based on the following guidelines, the character descripti
 
 ### Guidelines ###
 
-1. **Content and Guideline Verification**
-   - Ensure the response does not include out of character guidelines, instructions, evaluations, or rule reminders.
+- **Conciseness and Creativity**
+  - Respond with short, concise, and creative lines that advance the conversation.
+  - Avoid stalling, looping in thought, or repetitive phrasing.
 
-2. **Character Focus**
-   - Confirm that the response is written from {character_name}'s perspective (e.g. "{character_name} felt...", "{character_name} noticed...") or using first-person narration (e.g., "I felt...", "I saw..."). The response should contain one or more of the following: actions, dialogue, feelings, observations, intentions, thoughts and emotions.
+- **Character Consistency**
+  - Stay fully in character, ensuring each response reflects {character_name}'s personality and the ongoing context.
+  - Keep responses grounded in {character_name}’s perspective, aligning with and building upon the established conversation history without contradiction or deviation.
 
-3. **Character Consistency**
-   - Ensure only interactions with {known_characters_list} appear, with no references to characters outside this list.
+- **Content Relevance**
+  - Include actions, feelings, dialogue, or a combination thereof, addressing the latest message or an earlier one if more relevant.
+  - Advance the conversation by contributing meaningful content that enhances engagement and continuity.
 
-4. **Formatting**
-   - Only *italic* formatting is allowed (irrespective of usage). No other markdown elements such as horizontal lines (---, ___, or ***), **bold text**, or # headers are allowed.
+- **Formatting**
+  - Use *italic* formatting for inner reactions, thoughts, or subtle actions that add depth.
+  - Do not use other markdown elements or mention markdown.
 
-5. **Response Length**
-   - Check that the response is no more than a small number of lines. Ensure lines do not start with a datetime and/or "{character_name}:" as this is provided by the system.
+- **Response Structure**
+  - Do not start responses with "{character_name}:" as the voice is implied.
+  - If no response is required, return only "/skip".
 
-6. **Factual Consistency**
-   - Verify that the response is factually consistent with the events described in the recent conversation history, especially with respect to actions performed by characters. Ensure that actions performed by multiple characters are not confused or misattributed.
+- **Factual Consistency**
+  - Ensure factual consistency with the ongoing conversation, especially regarding actions performed by characters.
+  - Avoid misattributing actions or confusing character details.
 
-7. **Engagement and Continuity**
-   - Ensure the response advances the story or conversation.
----
+- **Exclusion of Meta-commentary**
+  - Exclude any meta-commentary, instructions, evaluations, or references to the chat interface or rules.
+  - Responses should be solely from {character_name}'s perspective without mentioning guidelines or system instructions.
+  
 
 ### Response to Validate ###
 {response_to_validate}
@@ -1115,7 +1123,7 @@ Based on the feedback provided, adjust the original response. Provide only the c
             is_checking=True,
             character_description=character_description
         )
-
+        #validation_result = "/pass"
         # Process the validation result
         validation_result = validation_result.strip()
         if validation_result == "/pass":
