@@ -20,8 +20,8 @@ from typing import List
 
 # Define constants
 OLLAMA_URL = "http://localhost:11434/api/chat"  # Replace with your Ollama endpoint if different
-MODEL_NAME = "tsiannian/magnum-72b-v1.q_k_m" #"finalend/l3-70b-euryale" #"vanilj/midnight-miqu-70b-v1.5:latest"  # The model version
-CHECK_MODEL_NAME = "tsiannian/magnum-72b-v1.q_k_m" #"jean-luc/big-tiger-gemma:27b-v1c-Q3_K_M"  # The model version
+MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"
+CHECK_MODEL_NAME = "llama3.1:70b-instruct-q4_K_M"
 CHARACTER_DIR = 'characters'  # Directory where character text files are stored
 LOG_FILE = 'app.log'  # Log file path
 # Configurable number of retries for LLM requests
